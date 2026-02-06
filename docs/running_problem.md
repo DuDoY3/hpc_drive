@@ -485,7 +485,7 @@ APP_NAME="System Management"
 APP_ENV=local
 APP_KEY=base64:mcpsuBdzZrrNWgkeea8LsQGnKPMMFnwRBgPiwI68NXc=
 APP_DEBUG=true
-APP_URL=http://localhost:8080
+APP_URL=http://localhost:8082
 
 LOG_CHANNEL=stack
 LOG_DEPRECATIONS_CHANNEL=null

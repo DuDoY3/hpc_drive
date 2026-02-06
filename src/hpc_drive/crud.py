@@ -62,17 +62,77 @@ def get_user_items_in_folder(
     Gets all non-trashed items for a specific user within a specific folder.
     If parent_id is None, it fetches items from the user's root.
     """
-    return (
+    if parent_id is None:
+        return (
+            db.query(models.DriveItem)
+            .options(joinedload(models.DriveItem.file_metadata))
+            .filter(
+                models.DriveItem.owner_id == owner_id,
+                models.DriveItem.parent_id == None,
+                models.DriveItem.is_trashed == False,
+            )
+            .order_by(models.DriveItem.item_type, models.DriveItem.name)
+            .all()
+        )
+
+    # Check access to the parent folder
+    parent_item = db.query(models.DriveItem).filter(models.DriveItem.item_id == parent_id).first()
+    if not parent_item:
+        return []
+
+    has_access = False
+    if parent_item.owner_id == owner_id:
+        has_access = True
+    else:
+        # Check if shared
+        share_entry = (
+            db.query(models.SharePermission)
+            .filter(
+                models.SharePermission.item_id == parent_id,
+                models.SharePermission.shared_with_user_id == owner_id
+            )
+            .first()
+        )
+        if share_entry:
+            has_access = True
+    
+    if not has_access:
+        return []
+
+    # If has access, return all items in that folder
+    items = (
         db.query(models.DriveItem)
         .options(joinedload(models.DriveItem.file_metadata))
         .filter(
-            models.DriveItem.owner_id == owner_id,
             models.DriveItem.parent_id == parent_id,
             models.DriveItem.is_trashed == False,
         )
         .order_by(models.DriveItem.item_type, models.DriveItem.name)
         .all()
     )
+
+    # If it was a shared access, propagate the shared status and permission to children
+    share_entry = None
+    if parent_item.owner_id != owner_id:
+         share_entry = (
+            db.query(models.SharePermission)
+            .filter(
+                models.SharePermission.item_id == parent_id,
+                models.SharePermission.shared_with_user_id == owner_id
+            )
+            .first()
+        )
+
+    if share_entry:
+        response_items = []
+        for item in items:
+            pydantic_item = schemas.DriveItemResponse.model_validate(item)
+            pydantic_item.is_shared = True
+            pydantic_item.shared_permission = share_entry.permission_level
+            response_items.append(pydantic_item)
+        return response_items
+
+    return items
 
 
 def create_file_with_metadata(
@@ -90,6 +150,21 @@ def create_file_with_metadata(
     """
 
     owner_type = get_owner_type(owner.role)
+    
+    # 0. Quota Validation
+    # Skip checks for ADMIN? User said "sinh viên và giáo viên", but usually quota applies to all non-admins.
+    if owner.role != UserRole.ADMIN:
+        if size > owner.max_file_size:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"File size exceeds the limit of {owner.max_file_size / (1024**3):.2f} GB. Please contact an admin for larger uploads."
+            )
+        
+        if (owner.used_storage or 0) + size > owner.storage_quota:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Storage quota exceeded. Please delete some files or contact an admin to increase your quota."
+            )
 
     # 1. Create the DriveItem
     db_item = models.DriveItem(
@@ -114,8 +189,16 @@ def create_file_with_metadata(
         )
         db.add(db_metadata)
 
+        # 2b. Update User Storage Usage
+        # Handle possible None if column was existing and not initialized
+        current_used = owner.used_storage or 0
+        owner.used_storage = current_used + size
+        db.add(owner)
+
         # 3. Commit both records at once
         db.commit()
+        db.refresh(db_item)
+        return db_item
 
         db.refresh(db_item)
         # We need to refresh the metadata relation as well
@@ -344,7 +427,7 @@ def share_item(
     db_share = models.SharePermission(
         item_id=item_id,
         shared_with_user_id=user_to_share_with.user_id,
-        permission_level=ShareLevel.VIEWER,
+        permission_level=share_data.permission_level,
     )
 
     db_item.permission = Permission.SHARED
@@ -364,14 +447,24 @@ def share_item(
 
 
 def get_shared_with_me_items(db: Session, user_id: int) -> list[models.DriveItem]:
-    return (
-        db.query(models.DriveItem)
+    results = (
+        db.query(models.DriveItem, models.SharePermission.permission_level)
         .join(models.SharePermission)
         .filter(models.SharePermission.shared_with_user_id == user_id)
         .options(joinedload(models.DriveItem.file_metadata))
         .filter(models.DriveItem.is_trashed == False)
         .all()
     )
+    
+    response_items = []
+    for item, permission_level in results:
+        # Convert to Pydantic model to ensure transient fields are included
+        pydantic_item = schemas.DriveItemResponse.model_validate(item)
+        pydantic_item.shared_permission = permission_level
+        pydantic_item.is_shared = True
+        response_items.append(pydantic_item)
+        
+    return response_items
 
 
 def get_drive_item(
@@ -445,6 +538,12 @@ def search_items(
         base_query = base_query.join(models.FileMetadata).filter(
             models.FileMetadata.mime_type.ilike(f"%{query.mime_type}%")
         )
+
+    if query.start_date:
+        base_query = base_query.filter(models.DriveItem.created_at >= query.start_date)
+
+    if query.end_date:
+        base_query = base_query.filter(models.DriveItem.created_at <= query.end_date)
 
     return base_query.order_by(models.DriveItem.name).all()
 
@@ -540,7 +639,29 @@ def delete_item_permanently(db: Session, item_id: uuid.UUID, owner_id: int):
             if item.item_type == ItemType.FILE and item.file_metadata:
                 _delete_file_from_storage(item.file_metadata.storage_path)
 
+    # Calculate total size to subtract from user usage
+    total_size_deleted = 0
+    if db_item.item_type == ItemType.FILE and db_item.file_metadata:
+        total_size_deleted = db_item.file_metadata.size
+    elif db_item.item_type == ItemType.FOLDER:
+        # Re-using the same search/logic but counting size
+        item_queue = [db_item]
+        while item_queue:
+            curr = item_queue.pop(0)
+            if curr.item_type == ItemType.FILE and curr.file_metadata:
+                total_size_deleted += curr.file_metadata.size
+            if curr.item_type == ItemType.FOLDER:
+                children = db.query(models.DriveItem).filter(models.DriveItem.parent_id == curr.item_id).all()
+                item_queue.extend(children)
+
     try:
+        # Decrement usage
+        owner = db.get(models.User, owner_id)
+        if owner:
+            current_used = owner.used_storage or 0
+            owner.used_storage = max(0, current_used - total_size_deleted)
+            db.add(owner)
+        
         db.delete(db_item)
         db.commit()
     except Exception as e:
@@ -575,7 +696,36 @@ def empty_user_trash(db: Session, owner_id: int):
         if item.parent_id is None or (item.parent and not item.parent.is_trashed)
     ]
 
+    # Calculate total size to subtract
+    total_size_deleted = 0
+    
+    # helper for recursive size
+    def get_folder_size(folder_id):
+        size = 0
+        items = db.query(models.DriveItem).filter(models.DriveItem.parent_id == folder_id).all()
+        for it in items:
+            if it.item_type == ItemType.FILE and it.file_metadata:
+                size += it.file_metadata.size
+            elif it.item_type == ItemType.FOLDER:
+                size += get_folder_size(it.item_id)
+        return size
+
+    for item in all_trashed_items:
+        if item.item_type == ItemType.FILE and item.file_metadata:
+            total_size_deleted += item.file_metadata.size
+        elif item.item_type == ItemType.FOLDER:
+            # We only count folders that are directly in the trash (not children of trashed folders)
+            # to avoid double counting if children also have is_trashed=True (though usually they don't)
+            if item in top_level_trashed_items:
+                total_size_deleted += get_folder_size(item.item_id)
+    
     try:
+        owner = db.get(models.User, owner_id)
+        if owner:
+            current_used = owner.used_storage or 0
+            owner.used_storage = max(0, current_used - total_size_deleted)
+            db.add(owner)
+
         for item in top_level_trashed_items:
             db.delete(item)
         db.commit()
@@ -646,3 +796,42 @@ def _delete_file_from_storage(storage_path: str | None):
                 pass
     except Exception as e:
         print(f"Error deleting file {storage_path} from disk: {e}")
+
+
+def admin_update_user_quota(
+    db: Session, user_id: int, quota_data: schemas.UserQuotaUpdate
+) -> models.User:
+    db_user = admin_get_user_by_id(db, user_id)
+    
+    if quota_data.storage_quota is not None:
+        db_user.storage_quota = quota_data.storage_quota
+    
+    if quota_data.max_file_size is not None:
+        db_user.max_file_size = quota_data.max_file_size
+        
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+
+def admin_recalculate_user_storage(db: Session, user_id: int) -> models.User:
+    """
+    Recalculate used_storage for a user by summing up all non-trashed files.
+    """
+    user = admin_get_user_by_id(db, user_id)
+    
+    # Sum of all files owned by user that are NOT in trash
+    total_size = (
+        db.query(func.sum(models.FileMetadata.size))
+        .join(models.DriveItem, models.DriveItem.item_id == models.FileMetadata.item_id)
+        .filter(models.DriveItem.owner_id == user_id)
+        .filter(models.DriveItem.is_trashed == False)
+        .scalar()
+    ) or 0
+    
+    user.used_storage = total_size
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user

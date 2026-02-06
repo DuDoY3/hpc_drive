@@ -7,7 +7,7 @@ This document outlines the API for downloading files from the Drive service, int
 The base URL for the Drive service API is:
 
 ```
-http://localhost:8080/api/v1/drive
+http://localhost:8082/api/v1/drive
 ```
 
 (Note: This is a placeholder. The actual base URL might differ in production environments.)

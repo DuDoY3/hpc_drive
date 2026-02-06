@@ -107,6 +107,14 @@ class User(Base):
     role: Mapped[UserRole] = mapped_column(SAEnum(UserRole))
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
+    # Storage Quota Management
+    # Default 10GB = 10 * 1024 * 1024 * 1024 bytes
+    storage_quota: Mapped[int] = mapped_column(BigInteger, default=10737418240)
+    # Total bytes used by non-trashed files
+    used_storage: Mapped[int] = mapped_column(BigInteger, default=0)
+    # Max size for a single file upload, default 2GB = 2 * 1024 * 1024 * 1024
+    max_file_size: Mapped[int] = mapped_column(BigInteger, default=2147483648)
+
     # Relations
     owned_items: Mapped[list["DriveItem"]] = relationship(back_populates="owner")
     shared_with_me: Mapped[list["SharePermission"]] = relationship(

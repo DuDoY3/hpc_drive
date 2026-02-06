@@ -119,6 +119,17 @@ def get_current_user(
         if user.role != new_role:
             user.role = new_role
             update_made = True
+            
+        # Ensure storage fields are initialized (for existing users after migration)
+        if user.storage_quota is None:
+            user.storage_quota = 10737418240 # 10GB
+            update_made = True
+        if user.used_storage is None:
+            user.used_storage = 0
+            update_made = True
+        if user.max_file_size is None:
+            user.max_file_size = 2147483648 # 2GB
+            update_made = True
 
         if update_made:
             print(

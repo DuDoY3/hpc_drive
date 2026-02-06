@@ -274,3 +274,17 @@ def empty_trash(
 ):
     crud.empty_user_trash(db=db, owner_id=current_user.user_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/usage", response_model=schemas.StorageUsageResponse)
+def get_storage_usage(
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Get current storage usage and limits for the user.
+    """
+    return {
+        "used_storage": current_user.used_storage,
+        "storage_quota": current_user.storage_quota,
+        "max_file_size": current_user.max_file_size,
+    }

@@ -27,9 +27,14 @@ async def lifespan(app: FastAPI):
     print("Shutting down...")
 
 
+# CORS Configuration - Specific origins required when using credentials
+# CRITICAL: When allow_credentials=True, browsers FORBID allow_origins=["*"]
+# Must specify exact origins for security compliance
 origins = [
-    "http://localhost:3000",
-    "http://localhost:3001",
+    "http://localhost:3001",   # Primary frontend port
+    "http://localhost:3000",   # Alternative frontend port
+    "http://127.0.0.1:3001",   # Localhost IP variant
+    "http://127.0.0.1:3000",   # Localhost IP variant
 ]
 
 
@@ -44,7 +49,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all methods (GET, POST, etc.)
+    allow_methods=["*"],  # Allow all methods (GET, POST, PUT, DELETE, OPTIONS, etc.)
     allow_headers=["*"],  # Allow all headers (Authorization, Content-Type, etc.)
 )
 

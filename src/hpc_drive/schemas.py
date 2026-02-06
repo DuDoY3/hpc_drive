@@ -98,6 +98,8 @@ class DriveItemResponse(DriveItemBase):
 
     # Nested metadata, will be None if it's a folder
     file_metadata: FileMetadataResponse | None = None
+    shared_permission: ShareLevel | None = None  # The permission level for the current user (if shared)
+    is_shared: bool = False
 
 
 class ShareCreate(BaseModel):
@@ -105,7 +107,7 @@ class ShareCreate(BaseModel):
 
     # We'll share by username, as it's unique and in our User model
     username: str
-    # We don't need 'level' since we default to VIEWER
+    permission_level: ShareLevel = ShareLevel.VIEWER
 
 
 class UserSimpleResponse(BaseModel):
@@ -153,6 +155,8 @@ class DriveItemSearchQuery(BaseModel):
     name: str | None = None  # Search for a name containing this string
     item_type: ItemType | None = None  # Filter by FILE or FOLDER
     mime_type: str | None = None  # Filter by a specific MIME type
+    start_date: datetime | None = None
+    end_date: datetime | None = None
 
 
 class UserResponse(BaseModel):
@@ -165,3 +169,21 @@ class UserResponse(BaseModel):
     email: str
     role: UserRole
     created_at: datetime
+    storage_quota: int
+    used_storage: int
+    max_file_size: int
+
+
+class UserQuotaUpdate(BaseModel):
+    """Schema for admin to update user storage limits"""
+
+    storage_quota: int | None = None
+    max_file_size: int | None = None
+
+
+class StorageUsageResponse(BaseModel):
+    """Schema for current user to see their usage"""
+
+    used_storage: int
+    storage_quota: int
+    max_file_size: int

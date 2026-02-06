@@ -28,7 +28,7 @@ uvicorn src.hpc_drive.main:app --reload --port 7777
 
 ### Login System-Management
 ```
-POST http://localhost:8080/api/v1/login
+POST http://localhost:8082/api/v1/login
 Content-Type: application/json
 
 {
@@ -51,16 +51,16 @@ Content-Type: application/json
 
 Tạo Environment "HPC Drive":
 - `base_url`: `http://localhost:7777`
-- `auth_url`: `http://localhost:8080`
+- `auth_url`: `http://localhost:8082`
 - `token`: `<paste_token_here>`
-- `system_management_url`: `http://localhost:8080` (hoặc docker: `http://auth-service:8080`)
+- `system_management_url`: `http://localhost:8082` (hoặc docker: `http://auth-service:8082`)
 
 **⚠️ Quan trọng:** Nếu chạy bằng Docker, HPC Drive cần biết đúng URL của System-Management:
 ```bash
 # File .env trong hpc_drive/
-SYSTEM_MANAGEMENT_URL=http://localhost:8080
+SYSTEM_MANAGEMENT_URL=http://localhost:8082
 # Hoặc nếu Docker network:
-SYSTEM_MANAGEMENT_URL=http://auth-service:8080
+SYSTEM_MANAGEMENT_URL=http://auth-service:8082
 ```
 
 ---
@@ -396,7 +396,7 @@ Content-Type: application/json
 - [ ] Swagger UI accessible
 
 ### Authentication
-- [ ] Login System-Management (port 8080)
+- [ ] Login System-Management (port 8082)
 - [ ] JWT token hoạt động
 - [ ] Invalid token → 401
 
@@ -436,7 +436,7 @@ Content-Type: application/json
 
 **Giải pháp:**
 ```
-POST http://localhost:8080/api/v1/login
+POST http://localhost:8082/api/v1/login
 # Lấy token mới
 ```
 

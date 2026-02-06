@@ -86,3 +86,28 @@ def delete_item_permanently(
     [ADMIN] Permanently delete any item. This is irreversible.
     """
     return crud.admin_delete_item_permanently(db=db, item_id=item_id)
+
+
+@router.patch("/users/{user_id}/quota", response_model=schemas.UserResponse)
+def update_user_quota(
+    user_id: int,
+    quota_data: schemas.UserQuotaUpdate,
+    admin_user: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_session),
+):
+    """
+    [ADMIN] Update a user's storage quota or max file size limit.
+    """
+    return crud.admin_update_user_quota(db=db, user_id=user_id, quota_data=quota_data)
+
+
+@router.post("/users/{user_id}/recalculate-storage", response_model=schemas.UserResponse)
+def recalculate_user_storage(
+    user_id: int,
+    admin_user: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_session),
+):
+    """
+    [ADMIN] Manually recalculate the user's used_storage based on existing files.
+    """
+    return crud.admin_recalculate_user_storage(db=db, user_id=user_id)
