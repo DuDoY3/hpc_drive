@@ -1,3 +1,4 @@
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -36,6 +37,11 @@ origins = [
     "http://127.0.0.1:3001",   # Localhost IP variant
     "http://127.0.0.1:3000",   # Localhost IP variant
 ]
+
+# Allow additional origins from environment variable
+env_origins = os.getenv("ALLOWED_ORIGINS", "")
+if env_origins:
+    origins.extend([origin.strip() for origin in env_origins.split(",") if origin.strip()])
 
 
 app = FastAPI(
