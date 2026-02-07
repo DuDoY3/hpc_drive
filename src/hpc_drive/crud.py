@@ -252,9 +252,7 @@ def trash_item(db: Session, item_id: uuid.UUID, owner_id: int) -> models.DriveIt
     db_item = get_item_for_owner(db, item_id, owner_id)
 
     if db_item.is_trashed:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="Item is already in trash"
-        )
+        return db_item
 
     db_item.is_trashed = True
     db_item.trashed_at = datetime.utcnow()
@@ -272,9 +270,7 @@ def restore_item(db: Session, item_id: uuid.UUID, owner_id: int) -> models.Drive
     db_item = get_item_for_owner(db, item_id, owner_id)
 
     if not db_item.is_trashed:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="Item is not in trash"
-        )
+        return db_item
 
     db_item.is_trashed = False
     db_item.trashed_at = None
