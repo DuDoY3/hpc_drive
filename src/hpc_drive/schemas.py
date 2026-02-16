@@ -100,6 +100,7 @@ class DriveItemResponse(DriveItemBase):
     file_metadata: FileMetadataResponse | None = None
     shared_permission: ShareLevel | None = None  # The permission level for the current user (if shared)
     is_shared: bool = False
+    owner_username: str | None = None  # Owner's username for shared items
 
 
 class ShareCreate(BaseModel):
@@ -155,8 +156,8 @@ class DriveItemSearchQuery(BaseModel):
     name: str | None = None  # Search for a name containing this string
     item_type: ItemType | None = None  # Filter by FILE or FOLDER
     mime_type: str | None = None  # Filter by a specific MIME type
-    start_date: datetime | None = None
-    end_date: datetime | None = None
+    start_date: str | None = None  # ISO format date string (YYYY-MM-DD)
+    end_date: str | None = None  # ISO format date string (YYYY-MM-DD)
 
 
 class UserResponse(BaseModel):

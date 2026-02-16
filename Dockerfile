@@ -25,8 +25,16 @@ WORKDIR $APP_HOME
 
 COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
 COPY --from=builder /usr/local/bin/uvicorn /usr/local/bin/uvicorn
+COPY --from=builder /usr/local/bin/alembic /usr/local/bin/alembic
 
+# Copy source code and Alembic configuration
 COPY src/ ./src/
+COPY alembic/ ./alembic/
+COPY alembic.ini ./
+
+# Copy entrypoint script
+COPY docker-entrypoint.sh /app/
+RUN chmod +x /app/docker-entrypoint.sh
 
 RUN mkdir -p /app/src/hpc_drive/uploads
 
@@ -37,4 +45,4 @@ ENV UPLOADS_DIR=/app/src/hpc_drive/uploads
 ENV DATABASE_URL="sqlite:////app/data/drive.db"
 ENV AUTH_SERVICE_ME_URL="http://auth_service:8082/api/v1/me"
 
-CMD ["uvicorn", "--app-dir", "src", "hpc_drive.main:app", "--host", "0.0.0.0", "--port", "7777"]
+ENTRYPOINT ["/app/docker-entrypoint.sh"]

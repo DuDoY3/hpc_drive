@@ -103,6 +103,7 @@ def get_user_items_in_folder(
     items = (
         db.query(models.DriveItem)
         .options(joinedload(models.DriveItem.file_metadata))
+        .options(joinedload(models.DriveItem.owner))  # Load owner for username
         .filter(
             models.DriveItem.parent_id == parent_id,
             models.DriveItem.is_trashed == False,
@@ -129,6 +130,7 @@ def get_user_items_in_folder(
             pydantic_item = schemas.DriveItemResponse.model_validate(item)
             pydantic_item.is_shared = True
             pydantic_item.shared_permission = share_entry.permission_level
+            pydantic_item.owner_username = item.owner.username if item.owner else None
             response_items.append(pydantic_item)
         return response_items
 
@@ -394,14 +396,21 @@ def share_item(
     """
     Shares an item with another user.
     """
+    print(f"🔍 [SHARE DEBUG] share_item called: item_id={item_id}, owner_id={owner_id}, target_username={share_data.username}, permission={share_data.permission_level}")
+    
     db_item = get_item_for_owner(db, item_id, owner_id)
+    print(f"🔍 [SHARE DEBUG] Item found: {db_item.name}")
+    
     user_to_share_with = get_user_by_username(db, share_data.username)
 
     if not user_to_share_with:
+        print(f"❌ [SHARE DEBUG] User '{share_data.username}' not found in database!")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"User '{share_data.username}' not found",
         )
+    
+    print(f"🔍 [SHARE DEBUG] Target user found: id={user_to_share_with.user_id}, username={user_to_share_with.username}")
 
     if user_to_share_with.user_id == owner_id:
         raise HTTPException(
@@ -419,6 +428,7 @@ def share_item(
     )
 
     if existing_share:
+        print(f"⚠️ [SHARE DEBUG] Item already shared with {share_data.username}")
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Item is already shared with {share_data.username}",
@@ -437,9 +447,11 @@ def share_item(
         db.add(db_item)
         db.commit()
         db.refresh(db_share)
+        print(f"✅ [SHARE DEBUG] Successfully shared {db_item.name} with {share_data.username}")
         return db_share
     except Exception as e:
         db.rollback()
+        print(f"❌ [SHARE DEBUG] Failed to commit: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to share item: {e}",
@@ -447,14 +459,23 @@ def share_item(
 
 
 def get_shared_with_me_items(db: Session, user_id: int) -> list[models.DriveItem]:
+    # DEBUG: Verify user_id
+    print(f"🔍 [CRUD DEBUG] get_shared_with_me_items for user_id={user_id}")
+    
     results = (
         db.query(models.DriveItem, models.SharePermission.permission_level)
-        .join(models.SharePermission)
+        .join(
+            models.SharePermission,
+            models.DriveItem.item_id == models.SharePermission.item_id
+        )
         .filter(models.SharePermission.shared_with_user_id == user_id)
         .options(joinedload(models.DriveItem.file_metadata))
+        .options(joinedload(models.DriveItem.owner))  # Load owner info
         .filter(models.DriveItem.is_trashed == False)
         .all()
     )
+    
+    print(f"🔍 [CRUD DEBUG] Query returned {len(results)} items")
     
     response_items = []
     for item, permission_level in results:
@@ -462,7 +483,11 @@ def get_shared_with_me_items(db: Session, user_id: int) -> list[models.DriveItem
         pydantic_item = schemas.DriveItemResponse.model_validate(item)
         pydantic_item.shared_permission = permission_level
         pydantic_item.is_shared = True
+        pydantic_item.owner_username = item.owner.username if item.owner else None
         response_items.append(pydantic_item)
+        
+        # DEBUG: Log each item
+        print(f"  - Item: {item.name}, Owner: {item.owner.username if item.owner else 'N/A'}, Permission: {permission_level}")
         
     return response_items
 
@@ -512,40 +537,60 @@ def search_items(
     db: Session, user_id: int, query: schemas.DriveItemSearchQuery
 ) -> list[models.DriveItem]:
     """
-    Searches for items across owned and shared items.
+    Tìm kiếm items (của mình hoặc được share).
+    Fix lỗi: Join rõ ràng, xử lý case-insensitive tốt hơn.
     """
+    
+    # 1. Base Query: Join bảng SharePermission rõ ràng
     base_query = (
         db.query(models.DriveItem)
-        .outerjoin(models.SharePermission)
+        .outerjoin(
+            models.SharePermission, 
+            models.DriveItem.item_id == models.SharePermission.item_id
+        )
         .filter(
+            # Điều kiện: Là chủ sở hữu HOẶC được chia sẻ
             or_(
                 models.DriveItem.owner_id == user_id,
                 models.SharePermission.shared_with_user_id == user_id,
             ),
+            # Điều kiện: Chưa bị xóa
             models.DriveItem.is_trashed == False,
         )
         .options(joinedload(models.DriveItem.file_metadata))
-        .distinct()
     )
 
+    # 2. Filter theo tên (Case-insensitive)
     if query.name:
-        base_query = base_query.filter(models.DriveItem.name.ilike(f"%{query.name}%"))
+        # Dùng ilike để tìm không phân biệt hoa thường
+        # check if query.name is not empty string
+        search_term = f"%{query.name}%"
+        base_query = base_query.filter(models.DriveItem.name.ilike(search_term))
 
+    # 3. Filter theo loại item (FILE/FOLDER)
     if query.item_type:
         base_query = base_query.filter(models.DriveItem.item_type == query.item_type)
 
-    if query.mime_type:
-        base_query = base_query.join(models.FileMetadata).filter(
+    # 4. Filter theo MIME TYPE (Chỉ áp dụng cho FILE)
+    # Lưu ý: Chỉ join khi thực sự cần thiết để tránh mất Folder nếu không tìm mime_type
+    if query.mime_type and query.mime_type.strip():
+        base_query = base_query.join(
+            models.FileMetadata,
+            models.DriveItem.item_id == models.FileMetadata.item_id
+        ).filter(
             models.FileMetadata.mime_type.ilike(f"%{query.mime_type}%")
         )
 
+    # 5. Filter theo ngày
     if query.start_date:
         base_query = base_query.filter(models.DriveItem.created_at >= query.start_date)
 
     if query.end_date:
         base_query = base_query.filter(models.DriveItem.created_at <= query.end_date)
 
-    return base_query.order_by(models.DriveItem.name).all()
+    # 6. Distinct và Order
+    # Distinct item_id để loại bỏ trùng lặp nếu 1 item được share nhiều lần (dù logic share không cho phép, nhưng an toàn hơn)
+    return base_query.distinct().order_by(models.DriveItem.name).all()
 
 
 def admin_get_all_items(
@@ -835,3 +880,275 @@ def admin_recalculate_user_storage(db: Session, user_id: int) -> models.User:
     db.commit()
     db.refresh(user)
     return user
+
+
+# ===== FILE EDITING FUNCTIONS =====
+
+
+def check_edit_permission(
+    db: Session, item_id: uuid.UUID, user_id: int
+) -> tuple[models.DriveItem, bool]:
+    """
+    Checks if a user can edit a file.
+    Returns tuple of (DriveItem, is_owner).
+    Raises HTTPException if user doesn't have edit permission.
+    """
+    db_item = (
+        db.query(models.DriveItem)
+        .options(joinedload(models.DriveItem.file_metadata))
+        .options(joinedload(models.DriveItem.owner))
+        .filter(models.DriveItem.item_id == item_id)
+        .first()
+    )
+
+    if not db_item:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Item not found"
+        )
+
+    if db_item.item_type != ItemType.FILE:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only files can be edited"
+        )
+
+    if db_item.is_trashed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot edit trashed items"
+        )
+
+    # Check if user is owner
+    if db_item.owner_id == user_id:
+        return db_item, True
+
+    # Check if file is shared with user with EDITOR permission
+    share_permission = (
+        db.query(models.SharePermission)
+        .filter(
+            models.SharePermission.item_id == item_id,
+            models.SharePermission.shared_with_user_id == user_id,
+        )
+        .first()
+    )
+
+    if share_permission:
+        if share_permission.permission_level == ShareLevel.EDITOR:
+            return db_item, False
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You only have viewer permission for this file"
+            )
+
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="You do not have permission to edit this file"
+    )
+
+
+def update_file_content(
+    db: Session,
+    item_id: uuid.UUID,
+    user_id: int,
+    new_content: bytes,
+    file_size: int,
+) -> models.DriveItem:
+    """
+    Updates file content with quota checking and version increment.
+    Works for both owner and users with EDITOR permission.
+    Quota is always updated for the file owner.
+    """
+    # Check permission
+    db_item, is_owner = check_edit_permission(db, item_id, user_id)
+
+    if not db_item.file_metadata:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File metadata not found"
+        )
+
+    # Calculate size difference
+    old_size = db_item.file_metadata.size
+    delta_size = file_size - old_size
+
+    # QUOTA OVERFLOW CHECK: Only check if file is getting larger
+    if delta_size > 0:
+        owner = db_item.owner
+        current_used = owner.used_storage or 0
+        
+        # Check if owner has enough quota for the increase
+        if current_used + delta_size > owner.storage_quota:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Owner quota exceeded. Need {delta_size / (1024**2):.2f} MB more, but only {(owner.storage_quota - current_used) / (1024**2):.2f} MB available."
+            )
+
+    # Write new content to storage
+    try:
+        storage_path = settings.UPLOADS_DIR / db_item.file_metadata.storage_path
+        
+        if not storage_path.parent.exists():
+            storage_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with storage_path.open("wb") as f:
+            f.write(new_content)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to write file: {e}"
+        )
+
+    # Update database
+    try:
+        # Update file metadata
+        db_item.file_metadata.size = file_size
+        db_item.file_metadata.version += 1  # Increment version
+        db_item.file_metadata.updated_at = datetime.utcnow()
+        
+        # Update drive item timestamp
+        db_item.updated_at = datetime.utcnow()
+        
+        # Update owner's storage quota
+        owner = db_item.owner
+        current_used = owner.used_storage or 0
+        owner.used_storage = current_used + delta_size
+        
+        db.add(db_item)
+        db.add(owner)
+        db.commit()
+        db.refresh(db_item)
+        
+        return db_item
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update database: {e}"
+        )
+
+
+def save_shared_file_copy(
+    db: Session,
+    item_id: uuid.UUID,
+    user_id: int,
+    new_content: bytes,
+    file_size: int,
+    filename: str,
+) -> models.DriveItem:
+    """
+    Creates a copy of a shared file in user's personal storage.
+    The new file belongs to the user who is saving the copy.
+    Quota is checked against the user's quota.
+    """
+    # First check if user has access to the original file
+    original_item = get_drive_item(db, item_id, user_id)
+    
+    if original_item.item_type != ItemType.FILE:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only files can be copied"
+        )
+    
+    if not original_item.file_metadata:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File metadata not found"
+        )
+    
+    # Get the user object
+    user = db.get(models.User, user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    # QUOTA CHECK for the user saving the copy
+    if user.role != UserRole.ADMIN:
+        if file_size > user.max_file_size:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"File size exceeds your limit of {user.max_file_size / (1024**3):.2f} GB."
+            )
+        
+        current_used = user.used_storage or 0
+        if current_used + file_size > user.storage_quota:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Your storage quota exceeded. Please delete some files."
+            )
+    
+    # Create new storage path
+    item_storage_id = uuid.uuid4()
+    relative_dir = Path(str(user_id)) / str(item_storage_id)
+    storage_dir = settings.UPLOADS_DIR / relative_dir
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    
+    storage_path = storage_dir / filename
+    db_storage_path = relative_dir / filename
+    
+    # Write content to new location
+    try:
+        with storage_path.open("wb") as f:
+            f.write(new_content)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to save file: {e}"
+        )
+    
+    # Create new DriveItem and FileMetadata
+    try:
+        owner_type = get_owner_type(user.role)
+        
+        # Create new drive item (in user's root)
+        new_item = models.DriveItem(
+            name=filename,
+            item_type=ItemType.FILE,
+            parent_id=None,  # Save to root
+            owner_id=user_id,
+            owner_type=owner_type,
+        )
+        db.add(new_item)
+        db.flush()
+        
+        # Create file metadata
+        new_metadata = models.FileMetadata(
+            item_id=new_item.item_id,
+            mime_type=original_item.file_metadata.mime_type,
+            size=file_size,
+            storage_path=str(db_storage_path),
+            version=1,  # New file starts at version 1
+        )
+        db.add(new_metadata)
+        
+        # Update user's storage quota
+        current_used = user.used_storage or 0
+        user.used_storage = current_used + file_size
+        db.add(user)
+        
+        db.commit()
+        db.refresh(new_item)
+        
+        return new_item
+    except IntegrityError:
+        db.rollback()
+        # Cleanup file
+        if storage_path.exists():
+            storage_path.unlink()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"A file with the name '{filename}' already exists in your root directory."
+        )
+    except Exception as e:
+        db.rollback()
+        # Cleanup file
+        if storage_path.exists():
+            storage_path.unlink()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create file copy: {e}"
+        )
+

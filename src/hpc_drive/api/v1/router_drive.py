@@ -241,12 +241,19 @@ def share_an_item(
 
 
 @router.get(
-    "/shared-with-me", response_model=List[schemas.DriveItemResponse], tags=["Sharing"]
+    "/shared-with-me", response_model=List[schemas.DriveItemResponse], tags=["Drive"]
 )
 def get_items_shared_with_me(
     current_user: User = Depends(get_current_user), db: Session = Depends(get_session)
 ):
-    return crud.get_shared_with_me_items(db=db, user_id=current_user.user_id)
+    # DEBUG: Log để verify user_id đúng
+    print(f"🔍 [DEBUG] get_items_shared_with_me called by user_id={current_user.user_id}, username={current_user.username}")
+    
+    items = crud.get_shared_with_me_items(db=db, user_id=current_user.user_id)
+    
+    print(f"🔍 [DEBUG] Returning {len(items)} items for user {current_user.username}")
+    
+    return items
 
 
 @router.get("/search", response_model=List[schemas.DriveItemResponse])
@@ -288,3 +295,83 @@ def get_storage_usage(
         "storage_quota": current_user.storage_quota,
         "max_file_size": current_user.max_file_size,
     }
+
+
+@router.put("/items/{item_id}/content", response_model=schemas.DriveItemResponse)
+async def edit_file_content(
+    item_id: uuid.UUID,
+    file: UploadFile = File(...),
+    save_copy: bool = Form(False),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+):
+    """
+    Edit file content. 
+    - If editing own file or shared file with EDITOR permission: updates the file
+    - If save_copy=True and file is shared: creates a copy in personal storage
+    """
+    # Read the uploaded file content
+    new_content = await file.read()
+    file_size = len(new_content)
+    
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file name provided")
+    
+    # Check if user is trying to save a copy
+    if save_copy:
+        # Create a copy in user's personal storage
+        return crud.save_shared_file_copy(
+            db=db,
+            item_id=item_id,
+            user_id=current_user.user_id,
+            new_content=new_content,
+            file_size=file_size,
+            filename=file.filename,
+        )
+    else:
+        # Update the existing file
+        return crud.update_file_content(
+            db=db,
+            item_id=item_id,
+            user_id=current_user.user_id,
+            new_content=new_content,
+            file_size=file_size,
+        )
+
+
+@router.get("/items/{item_id}/can-edit")
+def check_can_edit(
+    item_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+):
+    """
+    Check if the current user can edit a file.
+    Returns can_edit status and reason.
+    """
+    try:
+        db_item, is_owner = crud.check_edit_permission(
+            db=db,
+            item_id=item_id,
+            user_id=current_user.user_id
+        )
+        
+        if is_owner:
+            reason = "You are the owner of this file"
+        else:
+            reason = "You have editor permission for this file"
+        
+        return {
+            "can_edit": True,
+            "is_owner": is_owner,
+            "reason": reason,
+            "current_version": db_item.file_metadata.version if db_item.file_metadata else None,
+        }
+    except HTTPException as e:
+        return {
+            "can_edit": False,
+            "is_owner": False,
+            "reason": e.detail,
+            "current_version": None,
+        }
+

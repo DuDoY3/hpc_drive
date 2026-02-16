@@ -88,6 +88,15 @@ class SigningStatus(str, Enum):
     REJECTED = "REJECTED"
 
 
+class FolderType(str, Enum):
+    """Type of folder for special permission handling."""
+    NORMAL = "NORMAL"
+    SUBMISSION = "SUBMISSION"
+    CLASS_INFO = "CLASS_INFO"
+    # Future expansion: EXAM_BANK = "EXAM_BANK" (lecturer-only access)
+
+
+
 # --- Models (CONVERTED TO SNAKE_CASE) ---
 
 
@@ -162,6 +171,11 @@ class DriveItem(Base):
     # System-generated folder management
     is_system_generated: Mapped[bool] = mapped_column(Boolean, default=False)
     is_locked: Mapped[bool] = mapped_column(Boolean, default=False)
+    
+    # Folder type for special permission handling (SUBMISSION, CLASS_INFO, etc.)
+    folder_type: Mapped[FolderType | None] = mapped_column(
+        SAEnum(FolderType), nullable=True, default=None
+    )
 
     # Foreign Keys
     owner_id: Mapped[int] = mapped_column(ForeignKey("users.user_id"))

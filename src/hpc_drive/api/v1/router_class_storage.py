@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 
 from ...database import get_session
 from ...security import get_current_user, oauth2_scheme
-from ...models import User, DriveItem, ItemType, RepositoryType, OwnerType, ProcessStatus, FileMetadata
+from ...models import User, DriveItem, ItemType, RepositoryType, OwnerType, ProcessStatus, FileMetadata, FolderType
 from ...schemas_class_storage import (
     ClassFolderGenerateRequest,
     ClassFolderGenerateResponse,
@@ -108,7 +108,8 @@ async def create_folder(
     class_id: int,
     owner: User,
     is_system_generated: bool = False,
-    is_locked: bool = False
+    is_locked: bool = False,
+    folder_type: Optional[FolderType] = None
 ) -> DriveItem:
     """
     Create a folder in class storage.
@@ -121,6 +122,7 @@ async def create_folder(
         owner: Owner user
         is_system_generated: Mark as system-generated
         is_locked: Lock from user deletion
+        folder_type: Folder type (SUBMISSION, CLASS_INFO, etc.)
     
     Returns:
         Created DriveItem
@@ -136,6 +138,7 @@ async def create_folder(
         parent_id=parent.item_id if parent else None,
         is_system_generated=is_system_generated,
         is_locked=is_locked,
+        folder_type=folder_type,
         process_status=ProcessStatus.READY
     )
     
@@ -159,9 +162,11 @@ async def auto_generate_class_folders(
     
     Creates:
     - Root folder for class
+    - "Thông tin lớp học" with 3 subfolders
     - Semester folders (Kỳ 1, Kỳ 2, Kỳ 3, Kỳ 4)
     - Course folders (from System-Management API)
-    - "Thông tin lớp học" folder
+    - 5 standard subfolders per course: Bài giảng, Tài liệu tham khảo, 
+      Bài tập & Đề cương, Đề thi mẫu, Nộp bài
     
     **Permission:** Admin or Lecturer teaching the class
     """
@@ -198,24 +203,50 @@ async def auto_generate_class_folders(
             path="/"
         ))
         
-        # 2. Create "Thông tin lớp học" folder
-        info_folder = await create_folder(
+        # 2. Create "Thông tin lớp học" folder with subfolders
+        class_info_folder = await create_folder(
             session=session,
             name="Thông tin lớp học",
             parent=root,
             class_id=class_id,
             owner=current_user,
             is_system_generated=True,
-            is_locked=True
+            is_locked=True,
+            folder_type=FolderType.CLASS_INFO
         )
         
         folders_created.append(ClassFolderInfo(
-            item_id=info_folder.item_id,
-            name=info_folder.name,
+            item_id=class_info_folder.item_id,
+            name=class_info_folder.name,
             path="/Thông tin lớp học"
         ))
         
-        # 3. Create semester folders
+        # 2.1 Create subfolders under "Thông tin lớp học"
+        class_info_subfolders = [
+            "Danh sách lớp",
+            "Thời khóa biểu", 
+            "Biểu mẫu sinh viên"
+        ]
+        
+        for subfolder_name in class_info_subfolders:
+            subfolder = await create_folder(
+                session=session,
+                name=subfolder_name,
+                parent=class_info_folder,
+                class_id=class_id,
+                owner=current_user,
+                is_system_generated=True,
+                is_locked=True,
+                folder_type=FolderType.CLASS_INFO
+            )
+            
+            folders_created.append(ClassFolderInfo(
+                item_id=subfolder.item_id,
+                name=subfolder.name,
+                path=f"/Thông tin lớp học/{subfolder_name}"
+            ))
+        
+        # 3. Create semester folders and their contents
         for semester_num in range(1, 5):  # Kỳ 1 đến Kỳ 4
             semester_folder = await create_folder(
                 session=session,
@@ -238,27 +269,55 @@ async def auto_generate_class_folders(
                 courses = await system_management_service.get_courses(
                     token=token,
                     semester_id=semester_num,
-                    # Note: API filters by lecturer_id or department_id, not class_id
-                    # For now, get all courses and create folders
                     per_page=100
                 )
                 
                 for course in courses:
+                    course_name = course.get("name", f"Course {course['id']}")
+                    
+                    # Create course folder
                     course_folder = await create_folder(
                         session=session,
-                        name=course.get("name", f"Course {course['id']}"),
+                        name=course_name,
                         parent=semester_folder,
                         class_id=class_id,
                         owner=current_user,
                         is_system_generated=True,
-                        is_locked=False  # Not locked - lecturers can add content
+                        is_locked=True
                     )
                     
                     folders_created.append(ClassFolderInfo(
                         item_id=course_folder.item_id,
                         name=course_folder.name,
-                        path=f"/Kỳ {semester_num}/{course_folder.name}"
+                        path=f"/Kỳ {semester_num}/{course_name}"
                     ))
+                    
+                    # 4.1 Create 5 STANDARD subfolders for each course
+                    course_subfolders = [
+                        ("Bài giảng (Slides)", None),
+                        ("Tài liệu tham khảo (Ebooks/Links)", None),
+                        ("Bài tập & Đề cương", None),
+                        ("Đề thi mẫu", None),
+                        ("Nộp bài (Submission)", FolderType.SUBMISSION)
+                    ]
+                    
+                    for subfolder_name, folder_type in course_subfolders:
+                        subfolder = await create_folder(
+                            session=session,
+                            name=subfolder_name,
+                            parent=course_folder,
+                            class_id=class_id,
+                            owner=current_user,
+                            is_system_generated=True,
+                            is_locked=True,
+                            folder_type=folder_type
+                        )
+                        
+                        folders_created.append(ClassFolderInfo(
+                            item_id=subfolder.item_id,
+                            name=subfolder.name,
+                            path=f"/Kỳ {semester_num}/{course_name}/{subfolder_name}"
+                        ))
             
             except Exception as e:
                 logger.warning(f"Failed to fetch courses for semester {semester_num}: {e}")
@@ -303,11 +362,20 @@ async def list_class_items(
     **Returns:** List of files and folders
     
     **Permission:** Anyone in the class (students, lecturers)
+    
+    **Security:** Students can only see their own files in submission folders
     """
     logger.info(f"Listing items for class {class_id}, parent={parent_id}")
     
     # Permission check
     await check_class_permission(current_user, class_id, token, require_upload=False)
+    
+    # Determine parent folder context
+    current_folder = None
+    if parent_id:
+        current_folder = session.query(DriveItem).filter(
+            DriveItem.item_id == uuid.UUID(parent_id)
+        ).first()
     
     # Build query
     query = session.query(DriveItem).filter(
@@ -325,6 +393,13 @@ async def list_class_items(
             query = query.filter(DriveItem.parent_id == root.item_id)
         else:
             query = query.filter(DriveItem.parent_id == None)
+    
+    # SECURITY FIX: Filter submission folder for students
+    # Students can only see their own files in SUBMISSION folders
+    if current_folder and current_folder.folder_type == FolderType.SUBMISSION:
+        if current_user.role.value == "STUDENT":
+            query = query.filter(DriveItem.owner_id == current_user.user_id)
+            logger.info(f"Applied SUBMISSION filter for student {current_user.user_id}")
     
     items = query.all()
     
@@ -425,22 +500,62 @@ async def upload_to_class_storage(
         session.add(file_metadata)
         session.commit()
         
-        # 6. Notify students (don't fail upload if notification fails)
+        # 6. Smart notification system with context-aware priority
         try:
+            # Detect parent folder for priority
+            priority = "NORMAL"
+            notification_icon = "📄"
+            folder_context = "tài liệu"
+            
+            if parent_id:
+                parent_folder = session.query(DriveItem).filter(
+                    DriveItem.item_id == uuid.UUID(parent_id)
+                ).first()
+                
+                if parent_folder:
+                    # Skip notification for submission folders (student uploads)
+                    if parent_folder.folder_type == FolderType.SUBMISSION:
+                        logger.info("Skipping notification for submission folder")
+                        return {
+                            "message": "File uploaded successfully",
+                            "item_id": str(file_id),
+                            "filename": file.filename,
+                            "size": file_size
+                        }
+                    
+                    # Set priority based on folder name
+                    folder_name = parent_folder.name.lower()
+                    
+                    if "đề thi" in folder_name or "exam" in folder_name:
+                        priority = "URGENT"
+                        notification_icon = "🔴"
+                        folder_context = "đề thi"
+                    elif "bài tập" in folder_name or "assignment" in folder_name:
+                        priority = "HIGH"
+                        notification_icon = "📝"
+                        folder_context = "bài tập"
+                    elif "bài giảng" in folder_name or "slide" in folder_name:
+                        notification_icon = "📊"
+                        folder_context = "bài giảng"
+                    elif "tài liệu" in folder_name:
+                        notification_icon = "📚"
+                        folder_context = "tài liệu tham khảo"
+            
             await system_management_service.notify_class_students(
                 token=token,
                 class_id=class_id,
-                title=f"File mới trong lớp",
-                message=f"{current_user.username} đã upload {file.filename}",
+                title=f"{notification_icon} Tài liệu mới: {file.filename}",
+                message=f"{current_user.username} đã upload {folder_context} mới vào lớp học",
                 type="FILE_UPLOAD",
-                priority="NORMAL",
+                priority=priority,
                 metadata={
                     "class_id": class_id,
                     "drive_item_id": str(file_id),
-                    "filename": file.filename
+                    "filename": file.filename,
+                    "folder_type": folder_context
                 }
             )
-            logger.info(f"Notification sent for file upload: {file_id}")
+            logger.info(f"Notification sent for file upload: {file_id} with priority: {priority}")
         except Exception as e:
             logger.error(f"Failed to send notification: {e}")
             # Continue - upload was successful
@@ -451,6 +566,7 @@ async def upload_to_class_storage(
             "filename": file.filename,
             "size": file_size
         }
+
     
     except Exception as e:
         session.rollback()
@@ -501,9 +617,22 @@ async def get_my_classes(
             ]
         
         elif current_user.role.value == "STUDENT":
-            # TODO: Get classes student is enrolled in
-            # For now, return empty list
-            return []
+            # TODO: Get classes student is enrolled in from Laravel API
+            # For now, return mock data based on seeder
+            # This assumes student SV001 is in class CNTT65 (id=1)
+            
+            logger.info(f"Returning mock class data for student {current_user.user_id}")
+            
+            # Mock data matching AdminSeeder.php
+            return [
+                ClassListResponse(
+                    class_id=1,  # Matches class inserted in seeder
+                    class_name="Lớp CNTT K65",
+                    class_code="CNTT65",
+                    role="STUDENT",
+                    has_upload_permission=False
+                )
+            ]
         
         else:  # ADMIN
             # TODO: Get all classes

@@ -10,6 +10,7 @@ from .api.v1 import (
     router_department_storage,
     router_drive,
     router_signing,
+    router_submissions,
 )
 
 # Import from our new database file
@@ -58,9 +59,10 @@ app.add_middleware(
 app.include_router(router_drive.router, prefix="/api/v1")
 app.include_router(router_admin.router, prefix="/api/v1")
 app.include_router(router_class_storage.router, prefix="/api/v1")
-app.include_router(router_department_storage.router, prefix="/api/v1")  # NEW
-app.include_router(router_signing.router, prefix="/api/v1")  # NEW
+app.include_router(router_department_storage.router, prefix="/api/v1")
+app.include_router(router_signing.router, prefix="/api/v1")
 app.include_router(router_curriculum.router, prefix="/api/v1")
+app.include_router(router_submissions.router, prefix="/api/v1")  # Student submissions
 
 
 @app.get("/health")
