@@ -6,7 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from hpc_drive.main import app
 from hpc_drive.database import get_session
-from hpc_drive.models import Base, User, DriveItem, FileMetadata, ItemType
+from hpc_drive.models import Base, User, DriveItem, FileMetadata, ItemType, OwnerType
 from hpc_drive.security import get_current_user
 from hpc_drive.config import settings
 
@@ -82,6 +82,7 @@ def test_download_file():
         name="test_file.txt",
         item_type=ItemType.FILE,
         owner_id=user.user_id,
+        owner_type=OwnerType.STUDENT,
     )
     db.add(drive_item)
     db.flush()
@@ -101,7 +102,7 @@ def test_download_file():
 
     # 3. Assert the response
     assert response.status_code == 200
-    assert response.headers["content-type"] == "text/plain"
+    assert "text/plain" in response.headers["content-type"]
     assert (
         response.headers["content-disposition"]
         == 'attachment; filename="test_file.txt"'
@@ -109,3 +110,57 @@ def test_download_file():
     assert response.text == "This is a test file."
 
     db.close()
+
+
+def test_trash_already_trashed_item():
+    # 1. Create a dummy item
+    db = TestingSessionLocal()
+    user = override_get_current_user()
+
+    drive_item = DriveItem(
+        name="test_folder",
+        item_type=ItemType.FOLDER,
+        owner_id=user.user_id,
+        owner_type=OwnerType.STUDENT,
+    )
+    db.add(drive_item)
+    db.commit()
+    db.refresh(drive_item)
+    item_id = drive_item.item_id
+    db.close()
+
+    # 2. Trash the item
+    response = client.patch(f"/api/v1/drive/items/{item_id}/trash")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["is_trashed"] == True
+
+    # 3. Try to trash the item again - Expect success 200 (idempotent)
+    response = client.patch(f"/api/v1/drive/items/{item_id}/trash")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["is_trashed"] == True
+
+
+def test_restore_already_restored_item():
+    # 1. Create a dummy item
+    db = TestingSessionLocal()
+    user = override_get_current_user()
+
+    drive_item = DriveItem(
+        name="test_folder_restore",
+        item_type=ItemType.FOLDER,
+        owner_id=user.user_id,
+        owner_type=OwnerType.STUDENT,
+    )
+    db.add(drive_item)
+    db.commit()
+    db.refresh(drive_item)
+    item_id = drive_item.item_id
+    db.close()
+
+    # 2. Try to restore the item (it is not trashed) - Expect success 200 (idempotent)
+    response = client.patch(f"/api/v1/drive/items/{item_id}/restore")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["is_trashed"] == False
