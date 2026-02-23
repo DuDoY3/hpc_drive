@@ -61,7 +61,15 @@ def get_all_items(
     """
     [ADMIN] Get a paginated list of all drive items from all users.
     """
-    return crud.admin_get_all_items(db=db, skip=skip, limit=limit)
+    items = crud.admin_get_all_items(db=db, skip=skip, limit=limit)
+    # Populate transient fields (owner_username) from the eager-loaded owner relation
+    result = []
+    for item in items:
+        pydantic_item = schemas.DriveItemResponse.model_validate(item)
+        pydantic_item.owner_username = item.owner.username if item.owner else None
+        result.append(pydantic_item)
+    return result
+
 
 
 @router.get("/drive/items/{item_id}", response_model=schemas.DriveItemResponse)

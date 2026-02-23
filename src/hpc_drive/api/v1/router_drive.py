@@ -1,3 +1,4 @@
+import httpx
 import shutil
 import uuid
 from pathlib import Path
@@ -12,8 +13,8 @@ from ...config import settings
 
 # Updated imports
 from ...database import get_session
-from ...models import User
-from ...security import get_current_user, get_current_user_data_from_auth
+from ...models import User, UserRole
+from ...security import get_current_user, get_current_user_data_from_auth, oauth2_scheme, map_role
 
 router = APIRouter(prefix="/drive", tags=["Drive"])
 
@@ -229,14 +230,131 @@ def update_item_details(
     response_model=schemas.SharePermissionResponse,
     tags=["Sharing"],
 )
-def share_an_item(
+async def share_an_item(
     item_id: uuid.UUID,
     share_data: schemas.ShareCreate,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session),
+    token: str = Depends(oauth2_scheme),
 ):
+    # If target user doesn't exist locally, try to find them via Laravel API and auto-create
+    target_user = crud.get_user_by_username(db, share_data.username)
+    
+    if not target_user:
+        print(f"🔍 [SHARE] User '{share_data.username}' not found locally. Searching via Laravel API...")
+        target_user = await _sync_user_from_laravel(db, share_data.username, token)
+    
+    if not target_user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Không tìm thấy người dùng '{share_data.username}'. Hãy kiểm tra lại tên đăng nhập.",
+        )
+    
     return crud.share_item(
         db=db, item_id=item_id, owner_id=current_user.user_id, share_data=share_data
+    )
+
+
+async def _sync_user_from_laravel(db: Session, username: str, token: str) -> User | None:
+    """
+    Search for a user in the Laravel System-Management API and auto-create them locally.
+    This allows sharing with users who haven't opened the Drive page yet.
+    """
+    try:
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Search students
+            resp = await client.get(
+                f"{settings.AUTH_SERVICE_ME_URL.replace('/me', '/students')}",
+                headers=headers,
+                params={"search": username, "per_page": 10}
+            )
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                users_data = data.get("data", data) if isinstance(data, dict) else data
+                
+                if isinstance(users_data, list):
+                    for u in users_data:
+                        account = u.get("account", u)
+                        u_username = account.get("username", "")
+                        if u_username == username:
+                            user_id = u.get("id", account.get("id"))
+                            email = u.get("email", account.get("email", ""))
+                            is_admin = account.get("is_admin", False)
+                            user_type = u.get("user_type", account.get("user_type", "student"))
+                            
+                            new_user = User(
+                                user_id=user_id,
+                                username=username,
+                                email=email,
+                                role=map_role(user_type, is_admin),
+                            )
+                            db.add(new_user)
+                            db.commit()
+                            db.refresh(new_user)
+                            print(f"✅ [SHARE] Auto-synced user '{username}' (id={user_id}) from Laravel API")
+                            return new_user
+            
+            # Search lecturers
+            resp = await client.get(
+                f"{settings.AUTH_SERVICE_ME_URL.replace('/me', '/lecturers')}",
+                headers=headers,
+                params={"search": username, "per_page": 10}
+            )
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                users_data = data.get("data", data) if isinstance(data, dict) else data
+                
+                if isinstance(users_data, list):
+                    for u in users_data:
+                        account = u.get("account", u)
+                        u_username = account.get("username", "")
+                        if u_username == username:
+                            user_id = u.get("id", account.get("id"))
+                            email = u.get("email", account.get("email", ""))
+                            is_admin = account.get("is_admin", False)
+                            
+                            new_user = User(
+                                user_id=user_id,
+                                username=username,
+                                email=email,
+                                role=map_role("lecturer", is_admin),
+                            )
+                            db.add(new_user)
+                            db.commit()
+                            db.refresh(new_user)
+                            print(f"✅ [SHARE] Auto-synced lecturer '{username}' (id={user_id}) from Laravel API")
+                            return new_user
+        
+        print(f"❌ [SHARE] User '{username}' not found in Laravel API")
+        return None
+    except Exception as e:
+        print(f"⚠️ [SHARE] Failed to search Laravel API for '{username}': {e}")
+        return None
+
+
+@router.post(
+    "/items/{item_id}/copy-to-personal",
+    response_model=schemas.DriveItemResponse,
+    tags=["Sharing"],
+)
+def copy_item_to_personal(
+    item_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+):
+    """
+    Copy a shared file into the current user's personal storage (root folder).
+    Uses shutil.copy2 for disk-level copy — zero RAM usage, safe for large files.
+    """
+    return crud.copy_file_on_server(
+        db=db,
+        item_id=item_id,
+        user_id=current_user.user_id,
+        parent_id=None,  # Save to root
     )
 
 

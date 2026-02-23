@@ -3,7 +3,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict
 
-from .models import ItemType, Permission, ShareLevel, UserRole
+from .models import ItemType, Permission, RepositoryType, ShareLevel, UserRole
 
 
 class AuthAccount(BaseModel):
@@ -101,6 +101,8 @@ class DriveItemResponse(DriveItemBase):
     shared_permission: ShareLevel | None = None  # The permission level for the current user (if shared)
     is_shared: bool = False
     owner_username: str | None = None  # Owner's username for shared items
+    repository_type: RepositoryType | None = None  # Where the item is stored (PERSONAL/CLASS/DEPARTMENT)
+    repository_context_id: int | None = None  # ID of the class or department (if applicable)
 
 
 class ShareCreate(BaseModel):

@@ -161,7 +161,9 @@ class DriveItem(Base):
     repository_context_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     
     # Owner type for quick permission checks
-    owner_type: Mapped[OwnerType] = mapped_column(SAEnum(OwnerType))
+    owner_type: Mapped[OwnerType] = mapped_column(
+        SAEnum(OwnerType), default=OwnerType.STUDENT, server_default="STUDENT"
+    )
     
     # Process status for malware scanning
     process_status: Mapped[ProcessStatus] = mapped_column(

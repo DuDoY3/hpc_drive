@@ -1,18 +1,14 @@
 #!/bin/bash
 # Docker entrypoint script for HPC Drive
-# Automatically runs migrations before starting the server
+# Database tables are auto-created by SQLAlchemy on startup
 
 set -e
 
 echo "🚀 Starting HPC Drive Service..."
 
-# Run database migrations
-echo "📦 Running database migrations..."
-cd /app
-alembic upgrade head
+# Create data directory if it doesn't exist
+mkdir -p /app/data
 
-echo "✅ Migrations completed!"
-
-# Start the FastAPI server
+# Start the FastAPI server (tables auto-created via create_db_and_tables in main.py)
 echo "🌐 Starting FastAPI server..."
 exec uvicorn --app-dir src hpc_drive.main:app --host 0.0.0.0 --port 7777

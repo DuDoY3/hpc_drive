@@ -1,3 +1,4 @@
+import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -200,11 +201,6 @@ def create_file_with_metadata(
         # 3. Commit both records at once
         db.commit()
         db.refresh(db_item)
-        return db_item
-
-        db.refresh(db_item)
-        # We need to refresh the metadata relation as well
-        db.refresh(db_item, ["file_metadata"])
         return db_item
 
     except IntegrityError:
@@ -599,6 +595,7 @@ def admin_get_all_items(
     return (
         db.query(models.DriveItem)
         .options(joinedload(models.DriveItem.file_metadata))
+        .options(joinedload(models.DriveItem.owner))
         .order_by(models.DriveItem.created_at.desc())
         .offset(skip)
         .limit(limit)
@@ -1152,3 +1149,128 @@ def save_shared_file_copy(
             detail=f"Failed to create file copy: {e}"
         )
 
+
+def copy_file_on_server(
+    db: Session,
+    item_id: uuid.UUID,
+    user_id: int,
+    parent_id: uuid.UUID | None = None,
+) -> models.DriveItem:
+    """
+    Copy a shared (or owned) file into user's personal storage
+    using shutil.copy2 — disk-level copy, NO RAM loading.
+    Safe for files of any size (even 2GB+).
+    """
+    # 1. Verify the user has access to this item
+    original_item = get_drive_item(db, item_id, user_id)
+
+    if original_item.item_type != ItemType.FILE:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Chỉ có thể sao chép tệp, không phải thư mục.",
+        )
+
+    if not original_item.file_metadata:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Không tìm thấy metadata của tệp gốc.",
+        )
+
+    # 2. Get the user and check quota
+    user = db.get(models.User, user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Không tìm thấy người dùng.",
+        )
+
+    file_size = original_item.file_metadata.size
+
+    if user.role != UserRole.ADMIN:
+        if file_size > user.max_file_size:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Kích thước tệp vượt quá giới hạn {user.max_file_size / (1024**3):.2f} GB.",
+            )
+
+        current_used = user.used_storage or 0
+        if current_used + file_size > user.storage_quota:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Dung lượng lưu trữ đã đầy. Hãy xóa bớt tệp.",
+            )
+
+    # 3. Resolve source file path
+    source_path = settings.UPLOADS_DIR / original_item.file_metadata.storage_path
+
+    if not source_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Tệp gốc không tồn tại trên ổ đĩa.",
+        )
+
+    # 4. Create destination path
+    new_storage_id = uuid.uuid4()
+    relative_dir = Path(str(user_id)) / str(new_storage_id)
+    dest_dir = settings.UPLOADS_DIR / relative_dir
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    dest_path = dest_dir / original_item.name
+    db_storage_path = relative_dir / original_item.name
+
+    # 5. Copy file on disk using shutil.copy2 (preserves metadata, zero RAM)
+    try:
+        shutil.copy2(str(source_path), str(dest_path))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi khi sao chép tệp: {e}",
+        )
+
+    # 6. Create DB records
+    try:
+        owner_type = get_owner_type(user.role)
+
+        new_item = models.DriveItem(
+            name=original_item.name,
+            item_type=ItemType.FILE,
+            parent_id=parent_id,
+            owner_id=user_id,
+            owner_type=owner_type,
+        )
+        db.add(new_item)
+        db.flush()
+
+        new_metadata = models.FileMetadata(
+            item_id=new_item.item_id,
+            mime_type=original_item.file_metadata.mime_type,
+            size=file_size,
+            storage_path=str(db_storage_path),
+            version=1,
+        )
+        db.add(new_metadata)
+
+        # Update used storage
+        user.used_storage = (user.used_storage or 0) + file_size
+        db.add(user)
+
+        db.commit()
+        db.refresh(new_item)
+        return new_item
+
+    except IntegrityError:
+        db.rollback()
+        if dest_path.exists():
+            dest_path.unlink()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Tệp '{original_item.name}' đã tồn tại trong thư mục đích.",
+        )
+    except Exception as e:
+        db.rollback()
+        if dest_path.exists():
+            dest_path.unlink()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi khi tạo bản sao: {e}",
+        )
