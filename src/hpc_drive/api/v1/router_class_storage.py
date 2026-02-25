@@ -592,22 +592,10 @@ async def get_my_classes(
     try:
         if current_user.role.value == "TEACHER":
             # Get classes lecturer teaches
-            try:
-                classes = await system_management_service.get_lecturer_classes(
-                    token=token,
-                    lecturer_id=current_user.user_id
-                )
-            except Exception as e:
-                logger.warning(f"Failed to fetch lecturer classes from Laravel API: {e}")
-                logger.info("Falling back to mock data for lecturer")
-                # Fallback mock data when Laravel API is unavailable
-                classes = [
-                    {
-                        "id": 1,
-                        "class_name": "Lớp CNTT K65",
-                        "class_code": "CNTT65"
-                    }
-                ]
+            classes = await system_management_service.get_lecturer_classes(
+                token=token,
+                lecturer_id=current_user.user_id
+            )
             
             return [
                 ClassListResponse(
