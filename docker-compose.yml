@@ -12,6 +12,7 @@ services:
     environment:
       DATABASE_URL: "sqlite:////app/data/drive.db"
       AUTH_SERVICE_ME_URL: "http://hpc_web:80/api/v1/me"
+      SYSTEM_MANAGEMENT_URL: "http://hpc_web:80"
     networks:
       - system-management_hpc_network
     restart: unless-stopped
