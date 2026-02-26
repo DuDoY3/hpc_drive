@@ -22,6 +22,12 @@ class ClassFolderGenerateRequest(BaseModel):
     semester_id: Optional[int] = Field(None, description="Specific semester to generate folders for (optional)")
     
 
+class ClassFolderCreateRequest(BaseModel):
+    """Request to create a custom folder in class storage."""
+    name: str = Field(..., description="Folder name")
+    parent_id: Optional[str] = Field(None, description="Parent folder ID")
+
+
 class ClassStorageUploadRequest(BaseModel):
     """Metadata for uploading file to class storage."""
     

@@ -20,7 +20,8 @@ import os
 import shutil
 from pathlib import Path
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status
+from fastapi.responses import FileResponse, Response
 from sqlalchemy.orm import Session
 
 from ...database import get_session
@@ -31,7 +32,8 @@ from ...schemas_class_storage import (
     ClassFolderGenerateResponse,
     ClassFolderInfo,
     ClassItemResponse,
-    ClassListResponse
+    ClassListResponse,
+    ClassFolderCreateRequest
 )
 from ...integrations import system_management_service
 from ...config import settings
@@ -221,49 +223,7 @@ async def auto_generate_class_folders(
             path="/"
         ))
         
-        # 2. Create "Thông tin lớp học" folder with subfolders
-        class_info_folder = await create_folder(
-            session=session,
-            name="Thông tin lớp học",
-            parent=root,
-            class_id=class_id,
-            owner=current_user,
-            is_system_generated=True,
-            is_locked=True,
-            folder_type=FolderType.CLASS_INFO
-        )
-        
-        folders_created.append(ClassFolderInfo(
-            item_id=class_info_folder.item_id,
-            name=class_info_folder.name,
-            path="/Thông tin lớp học"
-        ))
-        
-        # 2.1 Create subfolders under "Thông tin lớp học"
-        class_info_subfolders = [
-            "Danh sách lớp",
-            "Thời khóa biểu", 
-            "Biểu mẫu sinh viên"
-        ]
-        
-        for subfolder_name in class_info_subfolders:
-            subfolder = await create_folder(
-                session=session,
-                name=subfolder_name,
-                parent=class_info_folder,
-                class_id=class_id,
-                owner=current_user,
-                is_system_generated=True,
-                is_locked=True,
-                folder_type=FolderType.CLASS_INFO
-            )
-            
-            folders_created.append(ClassFolderInfo(
-                item_id=subfolder.item_id,
-                name=subfolder.name,
-                path=f"/Thông tin lớp học/{subfolder_name}"
-            ))
-        
+
         # 3. Create semester folders and their contents
         for semester_num in range(1, 5):  # Kỳ 1 đến Kỳ 4
             semester_folder = await create_folder(
@@ -410,6 +370,91 @@ async def list_class_items(
     return result
 
 
+@router.post("/{class_id}/folders", response_model=ClassItemResponse)
+async def create_class_folder(
+    class_id: int,
+    request: ClassFolderCreateRequest,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+    token: str = Depends(oauth2_scheme)
+):
+    """
+    Create a custom folder in class storage.
+    
+    **Permission:** Lecturer teaching the class only
+    """
+    logger.info(f"Creating folder '{request.name}' in class {class_id} by user {current_user.user_id}")
+    
+    # Permission check (lecturer only)
+    await check_class_permission(current_user, class_id, token, require_upload=True)
+    
+    try:
+        # Determine parent folder
+        parent_folder = None
+        if request.parent_id:
+            parent_folder = session.query(DriveItem).filter(
+                DriveItem.item_id == uuid.UUID(request.parent_id),
+                DriveItem.repository_type == RepositoryType.CLASS,
+                DriveItem.repository_context_id == class_id,
+                DriveItem.item_type == ItemType.FOLDER
+            ).first()
+            
+            if not parent_folder:
+                raise HTTPException(status_code=404, detail="Parent folder not found")
+        else:
+            # Must have parent (normally root) for custom folders to keep it safe
+            parent_folder = get_class_root_folder(session, class_id)
+            if not parent_folder:
+                raise HTTPException(status_code=404, detail="Class root folder not found")
+                
+        # Check if folder with same name exists in parent
+        existing = session.query(DriveItem).filter(
+            DriveItem.parent_id == parent_folder.item_id,
+            DriveItem.name == request.name,
+            DriveItem.is_trashed == False
+        ).first()
+        
+        if existing:
+            raise HTTPException(status_code=400, detail=f"A file or folder with name '{request.name}' already exists here")
+            
+        # Create folder
+        new_folder = await create_folder(
+            session=session,
+            name=request.name,
+            parent=parent_folder,
+            class_id=class_id,
+            owner=current_user,
+            is_system_generated=False,
+            is_locked=False
+        )
+        
+        session.commit()
+        
+        return ClassItemResponse(
+            item_id=new_folder.item_id,
+            name=new_folder.name,
+            item_type=new_folder.item_type.value,
+            is_system_generated=new_folder.is_system_generated,
+            is_locked=new_folder.is_locked,
+            folder_type=None,
+            process_status=new_folder.process_status.value,
+            created_at=new_folder.created_at,
+            updated_at=new_folder.updated_at,
+            owner_id=new_folder.owner_id,
+            parent_id=new_folder.parent_id
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Failed to create folder: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create folder: {str(e)}"
+        )
+
+
 @router.post("/{class_id}/upload")
 async def upload_to_class_storage(
     class_id: int,
@@ -437,7 +482,10 @@ async def upload_to_class_storage(
     
     try:
         # 1. Create storage directory
-        upload_dir = Path(settings.UPLOAD_DIR) / "class_storage" / str(class_id)
+        relative_dir = Path("class_storage") / str(class_id)
+        # Fallback to UPLOADS_DIR if UPLOAD_DIR is not present
+        base_upload_dir = Path(getattr(settings, "UPLOADS_DIR", getattr(settings, "UPLOAD_DIR", "uploads")))
+        upload_dir = base_upload_dir / relative_dir
         upload_dir.mkdir(parents=True, exist_ok=True)
         
         # 2. Generate unique filename
@@ -445,6 +493,7 @@ async def upload_to_class_storage(
         file_ext = Path(file.filename).suffix
         storage_filename = f"{file_id}{file_ext}"
         storage_path = upload_dir / storage_filename
+        db_storage_path = relative_dir / storage_filename
         
         # 3. Save file
         with open(storage_path, "wb") as buffer:
@@ -475,7 +524,7 @@ async def upload_to_class_storage(
             item_id=file_id,
             mime_type=file.content_type or "application/octet-stream",
             size=file_size,
-            storage_path=str(storage_path),
+            storage_path=str(db_storage_path).replace("\\", "/"),
             version=1
         )
         
@@ -564,6 +613,243 @@ async def upload_to_class_storage(
         )
 
 
+@router.delete("/{class_id}/items/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_class_item(
+    class_id: int,
+    item_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+    token: str = Depends(oauth2_scheme)
+):
+    """
+    Delete an item from class storage.
+    Lecturers only.
+    """
+    await check_class_permission(current_user, class_id, token, require_upload=True)
+
+    item = session.query(DriveItem).filter(
+        DriveItem.repository_type == RepositoryType.CLASS,
+        DriveItem.repository_context_id == class_id,
+        DriveItem.item_id == item_id
+    ).first()
+
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    if item.is_locked:
+        raise HTTPException(status_code=403, detail="Cannot delete a locked folder")
+
+    # Delete the file from storage if applicable
+    if item.item_type == ItemType.FILE and item.file_metadata:
+        try:
+            full_file_path = Path(settings.UPLOAD_DIR) / item.file_metadata.storage_path
+            if full_file_path.is_file():
+                full_file_path.unlink()
+                # Optionally delete empty parent directory
+                try:
+                    full_file_path.parent.rmdir()
+                except OSError:
+                    pass
+        except Exception as e:
+            logger.error(f"Failed to delete file from disk: {e}")
+
+    session.delete(item)
+    session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/{class_id}/items/{item_id}/download", response_class=FileResponse)
+async def download_class_item(
+    class_id: int,
+    item_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+    token: str = Depends(oauth2_scheme)
+):
+    """
+    Download a file from class storage.
+    Both students and lecturers can download.
+    """
+    await check_class_permission(current_user, class_id, token, require_upload=False)
+
+    item = session.query(DriveItem).filter(
+        DriveItem.repository_type == RepositoryType.CLASS,
+        DriveItem.repository_context_id == class_id,
+        DriveItem.item_id == item_id
+    ).first()
+
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    if item.item_type != ItemType.FILE:
+        raise HTTPException(status_code=400, detail="Only files can be downloaded")
+
+    if not item.file_metadata or not item.file_metadata.storage_path:
+        raise HTTPException(status_code=404, detail="File metadata not found")
+
+    full_file_path = Path(settings.UPLOAD_DIR) / item.file_metadata.storage_path
+
+    if not full_file_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found on disk")
+
+    return FileResponse(
+        path=str(full_file_path),
+        filename=item.name,
+        media_type=item.file_metadata.mime_type or "application/octet-stream"
+    )
+
+
+@router.get("/{class_id}/items/{item_id}/can-edit")
+async def check_class_can_edit(
+    class_id: int,
+    item_id: uuid.UUID,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+    token: str = Depends(oauth2_scheme)
+):
+    """
+    Check if the current user can edit a class file.
+    Lecturers only.
+    """
+    try:
+        await check_class_permission(current_user, class_id, token, require_upload=True)
+        
+        item = session.query(DriveItem).filter(
+            DriveItem.repository_type == RepositoryType.CLASS,
+            DriveItem.repository_context_id == class_id,
+            DriveItem.item_id == item_id
+        ).first()
+
+        if not item:
+            raise HTTPException(status_code=404, detail="Item not found")
+
+        if item.item_type != ItemType.FILE:
+            raise HTTPException(status_code=400, detail="Only files can be edited")
+
+        if item.is_locked:
+            raise HTTPException(status_code=403, detail="File is locked and cannot be edited")
+
+        return {
+            "can_edit": True,
+            "is_owner": item.owner_id == current_user.user_id,
+            "reason": "You have lecturer access to this class",
+            "current_version": item.file_metadata.version if item.file_metadata else 1
+        }
+    except HTTPException as e:
+        return {
+            "can_edit": False,
+            "is_owner": False,
+            "reason": str(e.detail),
+            "current_version": None
+        }
+
+
+@router.put("/{class_id}/items/{item_id}/content", response_model=ClassItemResponse)
+async def map_edit_class_file_content(
+    class_id: int,
+    item_id: uuid.UUID,
+    file: UploadFile = File(...),
+    save_copy: bool = Form(False),
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+    token: str = Depends(oauth2_scheme)
+):
+    """
+    Update the content of a class file.
+    Lecturers only.
+    """
+    await check_class_permission(current_user, class_id, token, require_upload=True)
+
+    item = session.query(DriveItem).filter(
+        DriveItem.repository_type == RepositoryType.CLASS,
+        DriveItem.repository_context_id == class_id,
+        DriveItem.item_id == item_id
+    ).first()
+
+    if not item or item.item_type != ItemType.FILE:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    if save_copy:
+        # Saving a copy to personal storage
+        from ... import crud
+        new_content = await file.read()
+        storage_filename = f"{uuid.uuid4()}_{file.filename or item.name}"
+        storage_path = Path("users") / str(current_user.user_id) / storage_filename
+        
+        full_path = Path(settings.UPLOAD_DIR) / storage_path
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        with full_path.open("wb") as buffer:
+            buffer.write(new_content)
+            
+        file_copy = crud.create_file_atomically(
+            db=session,
+            owner=current_user,
+            filename=f"Copy of {file.filename or item.name}",
+            parent_id=None, # Root of personal drive
+            mime_type=item.file_metadata.mime_type if item.file_metadata else "application/octet-stream",
+            size=len(new_content),
+            storage_path=str(storage_path)
+        )
+        return {
+            "item_id": file_copy.item_id,
+            "name": file_copy.name,
+            "item_type": file_copy.item_type.value,
+            "is_system_generated": file_copy.is_system_generated,
+            "is_locked": file_copy.is_locked,
+            "folder_type": getattr(file_copy, 'folder_type', None),
+            "process_status": file_copy.process_status.value if file_copy.process_status else "READY",
+            "created_at": file_copy.created_at,
+            "updated_at": file_copy.updated_at,
+            "parent_id": file_copy.parent_id,
+            "file_size": file_copy.file_metadata.size if file_copy.file_metadata else None,
+            "mime_type": file_copy.file_metadata.mime_type if file_copy.file_metadata else None,
+            "owner_id": file_copy.owner_id,
+            "owner_name": file_copy.owner.username if getattr(file_copy, 'owner', None) else None
+        }
+
+    # Updating the original file directly
+    if not item.file_metadata or not item.file_metadata.storage_path:
+        raise HTTPException(status_code=404, detail="Original file metadata missing")
+        
+    full_file_path = Path(settings.UPLOAD_DIR) / item.file_metadata.storage_path
+
+    try:
+        new_content = await file.read()
+        with full_file_path.open("wb") as buffer:
+            buffer.write(new_content)
+            
+        item.file_metadata.size = len(new_content)
+        item.file_metadata.version = (item.file_metadata.version or 1) + 1
+        
+        # We don't change updated_at for DriveItem typically, but let's record it
+        import datetime
+        item.updated_at = datetime.datetime.utcnow()
+        
+        session.commit()
+        session.refresh(item)
+        
+        return {
+            "item_id": item.item_id,
+            "name": item.name,
+            "item_type": item.item_type.value,
+            "is_system_generated": item.is_system_generated,
+            "is_locked": item.is_locked,
+            "folder_type": item.folder_type.value if item.folder_type else None,
+            "process_status": item.process_status.value if item.process_status else "READY",
+            "created_at": item.created_at,
+            "updated_at": item.updated_at,
+            "parent_id": item.parent_id,
+            "file_size": item.file_metadata.size if item.file_metadata else None,
+            "mime_type": item.file_metadata.mime_type if item.file_metadata else None,
+            "owner_id": item.owner_id,
+            "owner_name": item.owner.username if getattr(item, 'owner', None) else None
+        }
+    except Exception as e:
+        session.rollback()
+        logger.error(f"Failed to save class file content: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
+
+print("=== REGISTERING ROUTE MY_CLASSES ===")
 @router.get("/my-classes", response_model=List[ClassListResponse])
 async def get_my_classes(
     current_user: User = Depends(get_current_user),

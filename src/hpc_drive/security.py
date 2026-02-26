@@ -142,6 +142,15 @@ def get_current_user(
         session.refresh(user)
     except Exception as e:
         session.rollback()
+        import sqlite3
+        from sqlalchemy.exc import IntegrityError
+        # Handle parallel requests race condition (another request inserted the user)
+        if isinstance(e, IntegrityError) or "UNIQUE constraint failed" in str(e):
+            print(f"Parallel insert detected for user {user_data.id}, falling back to fetch.")
+            user = session.get(User, user_data.id)
+            if user:
+                return user
+                
         print(f"Error committing user sync: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
