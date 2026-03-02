@@ -415,7 +415,10 @@ async def create_class_folder(
         ).first()
         
         if existing:
-            raise HTTPException(status_code=400, detail=f"A file or folder with name '{request.name}' already exists here")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Thư mục đã tồn tại. Vui lòng chọn tên khác."
+            )
             
         # Create folder
         new_folder = await create_folder(
@@ -484,14 +487,34 @@ async def upload_to_class_storage(
         # 1. Create storage directory
         relative_dir = Path("class_storage") / str(class_id)
         # Fallback to UPLOADS_DIR if UPLOAD_DIR is not present
-        base_upload_dir = Path(getattr(settings, "UPLOADS_DIR", getattr(settings, "UPLOAD_DIR", "uploads")))
+        base_upload_dir = Path(getattr(settings, "UPLOADS_DIR", "uploads"))
         upload_dir = base_upload_dir / relative_dir
         upload_dir.mkdir(parents=True, exist_ok=True)
         
         # 2. Generate unique filename
+        import os
+        base_name, ext = os.path.splitext(file.filename)
+        counter = 1
+        unique_filename = file.filename
+        
+        while True:
+            existing = session.query(DriveItem).filter(
+                DriveItem.name == unique_filename,
+                DriveItem.parent_id == uuid.UUID(parent_id) if parent_id else None,
+                DriveItem.repository_type == RepositoryType.CLASS,
+                DriveItem.repository_context_id == class_id,
+                DriveItem.item_type == ItemType.FILE,
+                DriveItem.is_trashed == False
+            ).first()
+            if not existing:
+                break
+            unique_filename = f"{base_name} ({counter}){ext}"
+            counter += 1
+            
+        file.filename = unique_filename
+        
         file_id = uuid.uuid4()
-        file_ext = Path(file.filename).suffix
-        storage_filename = f"{file_id}{file_ext}"
+        storage_filename = f"{file_id}{ext}"
         storage_path = upload_dir / storage_filename
         db_storage_path = relative_dir / storage_filename
         
@@ -529,6 +552,11 @@ async def upload_to_class_storage(
         )
         
         session.add(file_metadata)
+
+        # Bug Fix: Update the user's total used storage to reflect this upload
+        current_user.used_storage = (current_user.used_storage or 0) + file_size
+        session.add(current_user)
+
         session.commit()
         
         # 6. Smart notification system with context-aware priority
@@ -642,7 +670,7 @@ async def delete_class_item(
     # Delete the file from storage if applicable
     if item.item_type == ItemType.FILE and item.file_metadata:
         try:
-            full_file_path = Path(settings.UPLOAD_DIR) / item.file_metadata.storage_path
+            full_file_path = Path(settings.UPLOADS_DIR) / item.file_metadata.storage_path
             if full_file_path.is_file():
                 full_file_path.unlink()
                 # Optionally delete empty parent directory
@@ -687,7 +715,7 @@ async def download_class_item(
     if not item.file_metadata or not item.file_metadata.storage_path:
         raise HTTPException(status_code=404, detail="File metadata not found")
 
-    full_file_path = Path(settings.UPLOAD_DIR) / item.file_metadata.storage_path
+    full_file_path = Path(settings.UPLOADS_DIR) / item.file_metadata.storage_path
 
     if not full_file_path.is_file():
         raise HTTPException(status_code=404, detail="File not found on disk")
@@ -776,7 +804,7 @@ async def map_edit_class_file_content(
         storage_filename = f"{uuid.uuid4()}_{file.filename or item.name}"
         storage_path = Path("users") / str(current_user.user_id) / storage_filename
         
-        full_path = Path(settings.UPLOAD_DIR) / storage_path
+        full_path = Path(settings.UPLOADS_DIR) / storage_path
         full_path.parent.mkdir(parents=True, exist_ok=True)
         with full_path.open("wb") as buffer:
             buffer.write(new_content)
@@ -811,7 +839,7 @@ async def map_edit_class_file_content(
     if not item.file_metadata or not item.file_metadata.storage_path:
         raise HTTPException(status_code=404, detail="Original file metadata missing")
         
-    full_file_path = Path(settings.UPLOAD_DIR) / item.file_metadata.storage_path
+    full_file_path = Path(settings.UPLOADS_DIR) / item.file_metadata.storage_path
 
     try:
         new_content = await file.read()
@@ -936,4 +964,3 @@ async def get_my_classes(
             status_code=500,
             detail=f"Failed to get classes: {str(e)}"
         )
-

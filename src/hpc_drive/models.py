@@ -145,6 +145,7 @@ class DriveItem(Base):
     name: Mapped[str] = mapped_column(String(255))
     item_type: Mapped[ItemType] = mapped_column(SAEnum(ItemType))
     is_trashed: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_starred: Mapped[bool] = mapped_column(Boolean, default=False)
     trashed_at: Mapped[datetime | None] = mapped_column(DateTime)
     permission: Mapped[Permission] = mapped_column(
         SAEnum(Permission), default=Permission.PRIVATE

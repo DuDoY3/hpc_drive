@@ -66,6 +66,22 @@ def list_items_in_folder(
     return {"parent_id": parent_id, "items": items}
 
 
+@router.patch("/items/{item_id}/star", response_model=schemas.DriveItemResponse)
+def toggle_item_star(
+    item_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+):
+    """
+    Toggles the is_starred status of a drive item.
+    """
+    return crud.toggle_star_item(
+        db=db,
+        item_id=item_id,
+        user_id=current_user.user_id,
+    )
+
+
 @router.get("/items/{item_id}", response_model=schemas.DriveItemResponse)
 def get_item_details(
     item_id: uuid.UUID,
@@ -404,14 +420,21 @@ def empty_trash(
 @router.get("/usage", response_model=schemas.StorageUsageResponse)
 def get_storage_usage(
     current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
 ):
     """
     Get current storage usage and limits for the user.
     """
+    breakdown = crud.get_user_storage_breakdown(db, current_user.user_id)
+    
     return {
         "used_storage": current_user.used_storage,
         "storage_quota": current_user.storage_quota,
         "max_file_size": current_user.max_file_size,
+        "images_storage": breakdown["images_storage"],
+        "documents_storage": breakdown["documents_storage"],
+        "videos_storage": breakdown["videos_storage"],
+        "others_storage": breakdown["others_storage"],
     }
 
 
@@ -492,4 +515,3 @@ def check_can_edit(
             "reason": e.detail,
             "current_version": None,
         }
-

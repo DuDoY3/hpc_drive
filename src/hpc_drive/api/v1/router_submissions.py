@@ -108,7 +108,7 @@ async def submit_assignment(
             )
         
         # 2. Create storage directory
-        upload_dir = Path(settings.UPLOAD_DIR) / "class_storage" / str(class_id) / "submissions"
+        upload_dir = Path(settings.UPLOADS_DIR) / "class_storage" / str(class_id) / "submissions"
         upload_dir.mkdir(parents=True, exist_ok=True)
         
         # 3. Generate unique filename with student ID prefix
@@ -155,6 +155,11 @@ async def submit_assignment(
         )
         
         session.add(file_metadata)
+        
+        # Bug Fix: Update the user's total used storage to reflect this upload
+        current_user.used_storage = (current_user.used_storage or 0) + file_size
+        session.add(current_user)
+
         session.commit()
         
         logger.info(f"Student {current_user.user_id} submitted: {renamed_file}")

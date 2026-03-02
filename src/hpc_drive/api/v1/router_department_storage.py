@@ -184,7 +184,7 @@ async def upload_to_department_storage(
     
     try:
         # 1. Create storage directory
-        upload_dir = Path(settings.UPLOAD_DIR) / "department_storage" / str(department_id)
+        upload_dir = Path(settings.UPLOADS_DIR) / "department_storage" / str(department_id)
         upload_dir.mkdir(parents=True, exist_ok=True)
         
         # 2. Generate unique filename
@@ -227,6 +227,11 @@ async def upload_to_department_storage(
         )
         
         session.add(file_metadata)
+
+        # Bug Fix: Update the user's total used storage to reflect this upload
+        current_user.used_storage = (current_user.used_storage or 0) + file_size
+        session.add(current_user)
+
         session.commit()
         
         logger.info(f"File uploaded successfully: {file_id}")

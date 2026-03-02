@@ -94,6 +94,7 @@ class DriveItemResponse(DriveItemBase):
     created_at: datetime
     updated_at: datetime | None = None
     is_trashed: bool
+    is_starred: bool = False
     permission: Permission
 
     # Nested metadata, will be None if it's a folder
@@ -160,6 +161,7 @@ class DriveItemSearchQuery(BaseModel):
     mime_type: str | None = None  # Filter by a specific MIME type
     start_date: str | None = None  # ISO format date string (YYYY-MM-DD)
     end_date: str | None = None  # ISO format date string (YYYY-MM-DD)
+    is_starred: bool | None = None # Filter by starred status
 
 
 class UserResponse(BaseModel):
@@ -190,3 +192,7 @@ class StorageUsageResponse(BaseModel):
     used_storage: int
     storage_quota: int
     max_file_size: int
+    images_storage: int = 0
+    documents_storage: int = 0
+    videos_storage: int = 0
+    others_storage: int = 0

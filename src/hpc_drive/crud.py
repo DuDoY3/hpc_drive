@@ -31,6 +31,22 @@ def create_drive_item(
     """
     owner_type = get_owner_type(owner.role)
 
+    # Validate duplicate folder name explicitly
+    if item.item_type == "FOLDER":
+        existing_folder = db.query(models.DriveItem).filter(
+            models.DriveItem.name == item.name,
+            models.DriveItem.parent_id == item.parent_id,
+            models.DriveItem.owner_id == owner.user_id,
+            models.DriveItem.item_type == "FOLDER",
+            models.DriveItem.is_trashed == False
+        ).first()
+
+        if existing_folder:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Thư mục đã tồn tại. Vui lòng chọn tên khác."
+            )
+
     # Create the new item instance
     db_item = models.DriveItem(
         name=item.name,
@@ -168,6 +184,30 @@ def create_file_with_metadata(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Storage quota exceeded. Please delete some files or contact an admin to increase your quota."
             )
+
+    import os
+    
+    # 0.5 Auto-rename logic for conflicts
+    base_name, ext = os.path.splitext(filename)
+    counter = 1
+    unique_filename = filename
+    
+    while True:
+        existing_file = db.query(models.DriveItem).filter(
+            models.DriveItem.name == unique_filename,
+            models.DriveItem.parent_id == parent_id,
+            models.DriveItem.owner_id == owner.user_id,
+            models.DriveItem.item_type == ItemType.FILE,
+            models.DriveItem.is_trashed == False
+        ).first()
+        
+        if not existing_file:
+            break
+            
+        unique_filename = f"{base_name} ({counter}){ext}"
+        counter += 1
+
+    filename = unique_filename
 
     # 1. Create the DriveItem
     db_item = models.DriveItem(
@@ -578,13 +618,29 @@ def search_items(
         )
 
     # 5. Filter theo ngày
-    if query.start_date:
-        base_query = base_query.filter(models.DriveItem.created_at >= query.start_date)
+    try:
+        from datetime import datetime, time
+        
+        if query.start_date:
+            if len(query.start_date) == 10:
+                start_date_parsed = datetime.strptime(query.start_date, "%Y-%m-%d").date()
+                start_date_full = datetime.combine(start_date_parsed, time.min)
+                base_query = base_query.filter(models.DriveItem.created_at >= start_date_full)
 
-    if query.end_date:
-        base_query = base_query.filter(models.DriveItem.created_at <= query.end_date)
+        if query.end_date:
+            if len(query.end_date) == 10:
+                end_date_parsed = datetime.strptime(query.end_date, "%Y-%m-%d").date()
+                end_date_full = datetime.combine(end_date_parsed, time.max)
+                base_query = base_query.filter(models.DriveItem.created_at <= end_date_full)
+    except Exception as e:
+        print(f"Date filter parsing error: {e}")
+        pass
 
-    # 6. Distinct và Order
+    # 6. Filter theo is_starred
+    if query.is_starred is not None:
+        base_query = base_query.filter(models.DriveItem.is_starred == query.is_starred)
+
+    # 7. Distinct và Order
     # Distinct item_id để loại bỏ trùng lặp nếu 1 item được share nhiều lần (dù logic share không cho phép, nhưng an toàn hơn)
     return base_query.distinct().order_by(models.DriveItem.name).all()
 
@@ -601,6 +657,18 @@ def admin_get_all_items(
         .limit(limit)
         .all()
     )
+
+
+def toggle_star_item(db: Session, item_id: uuid.UUID, user_id: int) -> models.DriveItem:
+    """Toggles the is_starred status of a DriveItem."""
+    db_item = get_drive_item(db=db, item_id=item_id, user_id=user_id)
+    if not db_item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Item not found")
+
+    db_item.is_starred = not db_item.is_starred
+    db.commit()
+    db.refresh(db_item)
+    return db_item
 
 
 def admin_get_item_by_id(db: Session, item_id: uuid.UUID) -> models.DriveItem:
@@ -1274,3 +1342,61 @@ def copy_file_on_server(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Lỗi khi tạo bản sao: {e}",
         )
+
+
+def get_user_storage_breakdown(db: Session, user_id: int) -> dict:
+    """
+    Calculates the actual storage used by a user, grouped into categories:
+    Images, Videos, Documents, and Others.
+    """
+    # Define common document MIME types
+    doc_mimes = [
+        "application/pdf",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-powerpoint",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "text/plain",
+        "text/csv",
+        "application/rtf"
+    ]
+
+    # Join DriveItem and FileMetadata to sum 'size' grouped by 'mime_type'
+    results = (
+        db.query(
+            models.FileMetadata.mime_type,
+            func.sum(models.FileMetadata.size).label("total_size")
+        )
+        .join(models.DriveItem, models.DriveItem.item_id == models.FileMetadata.item_id)
+        .filter(
+            models.DriveItem.owner_id == user_id,
+            models.DriveItem.is_trashed == False,
+            models.DriveItem.item_type == ItemType.FILE
+        )
+        .group_by(models.FileMetadata.mime_type)
+        .all()
+    )
+
+    breakdown = {
+        "images_storage": 0,
+        "videos_storage": 0,
+        "documents_storage": 0,
+        "others_storage": 0,
+    }
+
+    for mime_type, total_size in results:
+        size = total_size or 0
+        if not mime_type:
+            breakdown["others_storage"] += size
+        elif mime_type.startswith("image/"):
+            breakdown["images_storage"] += size
+        elif mime_type.startswith("video/"):
+            breakdown["videos_storage"] += size
+        elif mime_type in doc_mimes:
+            breakdown["documents_storage"] += size
+        else:
+            breakdown["others_storage"] += size
+
+    return breakdown
