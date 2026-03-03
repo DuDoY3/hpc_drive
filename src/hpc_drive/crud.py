@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, exists, select, union_all
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
@@ -285,7 +285,10 @@ def get_item_for_owner(
 
 def trash_item(db: Session, item_id: uuid.UUID, owner_id: int) -> models.DriveItem:
     """
-    Moves an item (and its children, if a folder) to the trash.
+    Moves an item (and all its descendants recursively) to the trash.
+    Uses CTE for performance. To prevent accidental restoration of previously deleted files,
+    only the target folder gets a 'trashed_at' timestamp; children are marked 'is_trashed=True' 
+    but keep 'trashed_at=None'.
     """
     db_item = get_item_for_owner(db, item_id, owner_id)
 
@@ -294,10 +297,26 @@ def trash_item(db: Session, item_id: uuid.UUID, owner_id: int) -> models.DriveIt
             status_code=status.HTTP_400_BAD_REQUEST, detail="Item is already in trash"
         )
 
-    db_item.is_trashed = True
+    # 1. Collect all descendant IDs using a recursive CTE (Performance Optimized)
+    # This avoids the N+1 query problem
+    id_alias = select(models.DriveItem.item_id).where(models.DriveItem.item_id == item_id).cte(name="descendants", recursive=True)
+    
+    # We need to use the alias to join correctly
+    joined_alias = select(models.DriveItem.item_id).join(id_alias, models.DriveItem.parent_id == id_alias.c.item_id)
+    id_alias = id_alias.union_all(joined_alias)
+    
+    # Collect all IDs in a single pass
+    all_descendant_ids = [r[0] for r in db.execute(select(id_alias.c.item_id)).all()]
+
+    # 2. Mark all descendants as trashed in a single bulk update
+    db.query(models.DriveItem).filter(models.DriveItem.item_id.in_(all_descendant_ids)).update(
+        {models.DriveItem.is_trashed: True}, synchronize_session=False
+    )
+
+    # 3. Explicitly set trashed_at ONLY for the root item being trashed
+    # This allows us to distinguish between explicit and implicit deletions during restore
     db_item.trashed_at = datetime.utcnow()
 
-    db.add(db_item)
     db.commit()
     db.refresh(db_item)
     return db_item
@@ -305,7 +324,9 @@ def trash_item(db: Session, item_id: uuid.UUID, owner_id: int) -> models.DriveIt
 
 def restore_item(db: Session, item_id: uuid.UUID, owner_id: int) -> models.DriveItem:
     """
-    Restores an item from the trash.
+    Restores an item from the trash. 
+    Recursively restores children only if they were 'implicitly' trashed (i.e. is_trashed=True but trashed_at=None).
+    This ensures that files specifically deleted by the user before their parent folder was deleted remain trashed.
     """
     db_item = get_item_for_owner(db, item_id, owner_id)
 
@@ -314,10 +335,25 @@ def restore_item(db: Session, item_id: uuid.UUID, owner_id: int) -> models.Drive
             status_code=status.HTTP_400_BAD_REQUEST, detail="Item is not in trash"
         )
 
+    # 1. Collect all descendant IDs
+    id_alias = select(models.DriveItem.item_id).where(models.DriveItem.item_id == item_id).cte(name="descendants", recursive=True)
+    joined_alias = select(models.DriveItem.item_id).join(id_alias, models.DriveItem.parent_id == id_alias.c.item_id)
+    id_alias = id_alias.union_all(joined_alias)
+    
+    # 2. Bulk restore only the 'implicitly' trashed descendants
+    # (Those that have is_trashed=True but trashed_at IS NULL)
+    db.query(models.DriveItem).filter(
+        models.DriveItem.item_id.in_(select(id_alias.c.item_id)),
+        models.DriveItem.is_trashed == True,
+        models.DriveItem.trashed_at == None
+    ).update(
+        {models.DriveItem.is_trashed: False}, synchronize_session=False
+    )
+
+    # 3. Explicitly restore the target item
     db_item.is_trashed = False
     db_item.trashed_at = None
 
-    db.add(db_item)
     db.commit()
     db.refresh(db_item)
     return db_item
@@ -577,20 +613,19 @@ def search_items(
     Fix lỗi: Join rõ ràng, xử lý case-insensitive tốt hơn.
     """
     
-    # 1. Base Query: Join bảng SharePermission rõ ràng
+    # 1. Base Query: Avoid duplicates using exists() for sharing check
     base_query = (
         db.query(models.DriveItem)
-        .outerjoin(
-            models.SharePermission, 
-            models.DriveItem.item_id == models.SharePermission.item_id
-        )
         .filter(
-            # Điều kiện: Là chủ sở hữu HOẶC được chia sẻ
+            # Condition: User is owner OR item is shared with user
             or_(
                 models.DriveItem.owner_id == user_id,
-                models.SharePermission.shared_with_user_id == user_id,
+                exists().where(
+                    models.SharePermission.item_id == models.DriveItem.item_id,
+                    models.SharePermission.shared_with_user_id == user_id,
+                ),
             ),
-            # Điều kiện: Chưa bị xóa
+            # Condition: Not trashed
             models.DriveItem.is_trashed == False,
         )
         .options(joinedload(models.DriveItem.file_metadata))
@@ -648,10 +683,12 @@ def search_items(
 def admin_get_all_items(
     db: Session, skip: int = 0, limit: int = 100
 ) -> list[models.DriveItem]:
+    """[Admin] Gets all active (non-trashed) items in God Mode."""
     return (
         db.query(models.DriveItem)
         .options(joinedload(models.DriveItem.file_metadata))
         .options(joinedload(models.DriveItem.owner))
+        .filter(models.DriveItem.is_trashed == False) # Exclude trashed files by default
         .order_by(models.DriveItem.created_at.desc())
         .offset(skip)
         .limit(limit)
