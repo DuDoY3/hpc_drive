@@ -8,6 +8,7 @@ from .config import settings
 from .database import get_session
 from .models import User, UserRole  # Our local SQLModel User
 from .schemas import AuthMeResponse, UserDataFromAuth  # The new schemas
+from . import crud
 
 # This just extracts the "Bearer <token>" string
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
@@ -99,11 +100,17 @@ def get_current_user(
         print(f"User not found locally (ID: {user_data.id}). Syncing new user...")
 
         # ***** CORRECTED TO SNAKE_CASE *****
+        # Get default quota from system settings
+        sys_settings = crud.get_system_settings(session)
+        default_quota_bytes = sys_settings.default_quota_gb * (1024**3)
+
         user = User(
             user_id=user_data.id,
             username=user_data.account.username,
             email=user_data.email,
             role=new_role,
+            storage_quota=default_quota_bytes,
+            max_file_size=sys_settings.max_upload_size_mb * (1024**2)
         )
         session.add(user)
 
@@ -121,15 +128,23 @@ def get_current_user(
             update_made = True
             
         # Ensure storage fields are initialized (for existing users after migration)
-        if user.storage_quota is None:
-            user.storage_quota = 10737418240 # 10GB
-            update_made = True
+        if user.storage_quota is None or user.storage_quota == 10737418240:
+            # Only update if it's None or the old hardcoded default, 
+            # and the user doesn't have a custom quota
+            if user.custom_storage_quota_gb is None:
+                sys_settings = crud.get_system_settings(session)
+                user.storage_quota = sys_settings.default_quota_gb * (1024**3)
+                update_made = True
+                
         if user.used_storage is None:
             user.used_storage = 0
             update_made = True
-        if user.max_file_size is None:
-            user.max_file_size = 2147483648 # 2GB
-            update_made = True
+            
+        if user.max_file_size is None or user.max_file_size == 2147483648:
+            if user.role != UserRole.ADMIN: # Admins usually have higher limits or handled elsewhere
+                 sys_settings = crud.get_system_settings(session)
+                 user.max_file_size = sys_settings.max_upload_size_mb * (1024**2)
+                 update_made = True
 
         if update_made:
             print(

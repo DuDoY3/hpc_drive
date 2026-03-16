@@ -177,7 +177,7 @@ async def list_curriculum_materials(
         return []
 
     items = crud.get_items_in_folder_admin_view(db, subject_folder.item_id)
-    return items
+    return crud.populate_stars_to_dicts(db, current_user.user_id, items)
 
 
 @router.delete("/{item_id}", status_code=status.HTTP_204_NO_CONTENT)

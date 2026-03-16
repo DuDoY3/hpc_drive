@@ -113,20 +113,22 @@ def download_item(
         user_id=current_user.user_id,
     )
 
-    if db_item.item_type != "FILE":
+    # db_item is now a DICT. We must use .get() instead of dot notation.
+    if db_item.get("item_type") != "FILE":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Only files can be downloaded",
         )
 
-    if not db_item.file_metadata or not db_item.file_metadata.storage_path:
+    file_metadata = db_item.get("file_metadata")
+    if not file_metadata or not file_metadata.get("storage_path"):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="File not found",
         )
 
     # Construct the absolute path from the base uploads dir and the relative path
-    full_file_path = settings.UPLOADS_DIR / db_item.file_metadata.storage_path
+    full_file_path = settings.UPLOADS_DIR / file_metadata.get("storage_path")
 
     if not full_file_path.is_file():
         raise HTTPException(
@@ -134,10 +136,18 @@ def download_item(
             detail="File not found on disk",
         )
 
+    from urllib.parse import quote
+    
+    encoded_filename = quote(db_item.get("name", "downloaded_file"))
+    headers = {
+        "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}",
+        "Access-Control-Expose-Headers": "Content-Disposition"
+    }
+
     return FileResponse(
         path=str(full_file_path),
-        filename=db_item.name,
-        media_type=db_item.file_metadata.mime_type,
+        media_type=file_metadata.get("mime_type", "application/octet-stream"),
+        headers=headers
     )
 
 
@@ -158,6 +168,24 @@ def upload_file(
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file name provided")
 
+    # 0. Check System Settings constraints
+    settings_data = crud.get_system_settings(db)
+    
+    # Extension Check
+    ext = file.filename.split('.')[-1].lower() if '.' in file.filename else ""
+    blocked_exts = [e.strip().lower() for e in settings_data.blocked_extensions.split(',')]
+    if ext in blocked_exts:
+        raise HTTPException(status_code=400, detail=f"Định dạng file '{ext}' không được phép tải lên hệ thống.")
+        
+    # Owner Quota Check setup
+    if current_user.is_unlimited_storage:
+        user_quota = float('inf')
+    else:
+        user_quota = current_user.custom_storage_quota_gb * 1024**3 if current_user.custom_storage_quota_gb else settings_data.default_quota_gb * 1024**3
+        
+    available_quota = max(0, user_quota - (current_user.used_storage or 0))
+    max_size_bytes = settings_data.max_upload_size_mb * 1024 * 1024
+
     # 1. Define the storage path
     item_storage_id = uuid.uuid4()
     # The relative path that will be stored in the database
@@ -168,31 +196,56 @@ def upload_file(
     storage_path = storage_dir / file.filename
     db_storage_path = relative_dir / file.filename
 
-    # 2. Save the file to disk
+    # 2. Save the file to disk while validating size AND calculating hash
+    import hashlib
+    file_hash = hashlib.sha256()
+    file_size = 0
+    
     try:
         with storage_path.open("wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+            while chunk := file.file.read(8192):
+                file_size += len(chunk)
+                if file_size > max_size_bytes:
+                    raise HTTPException(status_code=400, detail=f"File exceeds maximum allowed size of {settings_data.max_upload_size_mb} MB")
+                if current_user.role != UserRole.ADMIN and file_size > available_quota:
+                    raise HTTPException(status_code=400, detail="Storage Quota Exceeded")
+                file_hash.update(chunk)
+                buffer.write(chunk)
     except Exception as e:
+        if storage_path.exists(): storage_path.unlink()
+        if storage_dir.exists(): storage_dir.rmdir()
+        if isinstance(e, HTTPException): raise e
         raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
     finally:
         file.file.close()
 
-    # 3. Get file size from the saved file
-    file_size = storage_path.stat().st_size
-
     # Provide a default MIME type if one isn't provided
     mime_type = file.content_type if file.content_type else "application/octet-stream"
+
+    # 3. VirusTotal Scan
+    from ...scanner import check_hash_virustotal
+    from ...models import ProcessStatus
+    
+    process_status = ProcessStatus.READY
+    if settings_data.quarantine_enabled:
+        process_status = check_hash_virustotal(file_hash.hexdigest())
+        if process_status == ProcessStatus.INFECTED:
+            # Delete file and abort
+            if storage_path.exists(): storage_path.unlink()
+            if storage_dir.exists(): storage_dir.rmdir()
+            raise HTTPException(status_code=400, detail="Upload failed: Malware detected.")
 
     # 4. Call the new CRUD function to create both DB records
     try:
         db_item = crud.create_file_with_metadata(
             db=db,
-            owner=current_user,  # Pass the user object here
+            owner=current_user,
             filename=file.filename,
             parent_id=parent_id,
             mime_type=mime_type,
             size=file_size,
             storage_path=str(db_storage_path),
+            process_status=process_status,
         )
         return db_item
     except HTTPException as e:
@@ -273,83 +326,64 @@ async def share_an_item(
 
 async def _sync_user_from_laravel(db: Session, username: str, token: str) -> User | None:
     """
-    Search for a user in the Laravel System-Management API and auto-create them locally.
-    This allows sharing with users who haven't opened the Drive page yet.
+    Search for a user in the Laravel System-Management API via /users/search endpoint
+    and auto-create them locally. This allows sharing with users who haven't opened Drive yet.
+    The endpoint only requires JWT auth (no admin/lecturer role needed).
     """
     try:
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        search_url = settings.AUTH_SERVICE_ME_URL.replace('/me', '/users/search')
         
         async with httpx.AsyncClient(timeout=10.0) as client:
-            # Search students
             resp = await client.get(
-                f"{settings.AUTH_SERVICE_ME_URL.replace('/me', '/students')}",
+                search_url,
                 headers=headers,
-                params={"search": username, "per_page": 10}
+                params={"username": username}
             )
+            
+            print(f"🔍 [SHARE] Laravel /users/search response: {resp.status_code}")
             
             if resp.status_code == 200:
                 data = resp.json()
-                users_data = data.get("data", data) if isinstance(data, dict) else data
                 
-                if isinstance(users_data, list):
-                    for u in users_data:
-                        account = u.get("account", u)
-                        u_username = account.get("username", "")
-                        if u_username == username:
-                            user_id = u.get("id", account.get("id"))
-                            email = u.get("email", account.get("email", ""))
-                            is_admin = account.get("is_admin", False)
-                            user_type = u.get("user_type", account.get("user_type", "student"))
-                            
-                            new_user = User(
-                                user_id=user_id,
-                                username=username,
-                                email=email,
-                                role=map_role(user_type, is_admin),
-                            )
-                            db.add(new_user)
-                            db.commit()
-                            db.refresh(new_user)
-                            print(f"✅ [SHARE] Auto-synced user '{username}' (id={user_id}) from Laravel API")
-                            return new_user
-            
-            # Search lecturers
-            resp = await client.get(
-                f"{settings.AUTH_SERVICE_ME_URL.replace('/me', '/lecturers')}",
-                headers=headers,
-                params={"search": username, "per_page": 10}
-            )
-            
-            if resp.status_code == 200:
-                data = resp.json()
-                users_data = data.get("data", data) if isinstance(data, dict) else data
-                
-                if isinstance(users_data, list):
-                    for u in users_data:
-                        account = u.get("account", u)
-                        u_username = account.get("username", "")
-                        if u_username == username:
-                            user_id = u.get("id", account.get("id"))
-                            email = u.get("email", account.get("email", ""))
-                            is_admin = account.get("is_admin", False)
-                            
-                            new_user = User(
-                                user_id=user_id,
-                                username=username,
-                                email=email,
-                                role=map_role("lecturer", is_admin),
-                            )
-                            db.add(new_user)
-                            db.commit()
-                            db.refresh(new_user)
-                            print(f"✅ [SHARE] Auto-synced lecturer '{username}' (id={user_id}) from Laravel API")
-                            return new_user
-        
-        print(f"❌ [SHARE] User '{username}' not found in Laravel API")
-        return None
+                if data.get("found"):
+                    user_id = data.get("id")
+                    email = data.get("email", "")
+                    is_admin = data.get("is_admin", False)
+                    user_type = data.get("user_type", "student")
+                    
+                    new_user = User(
+                        user_id=user_id,
+                        username=username,
+                        email=email,
+                        role=map_role(user_type, is_admin),
+                    )
+                    db.add(new_user)
+                    db.commit()
+                    db.refresh(new_user)
+                    print(f"✅ [SHARE] Auto-synced user '{username}' (id={user_id}, type={user_type}) from Laravel API")
+                    return new_user
+                else:
+                    return None
+            else:
+                # Trả về lỗi chi tiết lên frontend để debug
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Lỗi từ Laravel API: Status {resp.status_code}. Body: {resp.text}"
+                )
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Lỗi kết nối đến Laravel API: {e}"
+        )
     except Exception as e:
-        print(f"⚠️ [SHARE] Failed to search Laravel API for '{username}': {e}")
-        return None
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi không xác định khi tìm người dùng: {e}"
+        )
+
 
 
 @router.post(
@@ -426,11 +460,18 @@ def get_storage_usage(
     Get current storage usage and limits for the user.
     """
     breakdown = crud.get_user_storage_breakdown(db, current_user.user_id)
+    settings_data = crud.get_system_settings(db)
+    
+    # Sử dụng trực tiếp trường storage_quota đã được đồng bộ ở backend
+    quota = current_user.storage_quota
+    
+    # Max file size vẫn lấy từ system settings nếu cần, hoặc có thể lưu riêng lẻ per user
+    max_file_size = current_user.max_file_size
     
     return {
-        "used_storage": current_user.used_storage,
-        "storage_quota": current_user.storage_quota,
-        "max_file_size": current_user.max_file_size,
+        "used_storage": current_user.used_storage or 0,
+        "storage_quota": quota,
+        "max_file_size": max_file_size,
         "images_storage": breakdown["images_storage"],
         "documents_storage": breakdown["documents_storage"],
         "videos_storage": breakdown["videos_storage"],

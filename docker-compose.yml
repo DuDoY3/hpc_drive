@@ -7,11 +7,13 @@ services:
     ports:
       - "7777:7777"
     volumes:
-      - drive_data:/app/data # Persistent volume for SQLite DB and potentially other data
-      - uploads_data:/app/src/hpc_drive/uploads # Persistent volume for uploaded files
+      - drive_data:/app/data 
+      - uploads_data:/app/src/hpc_drive/uploads 
     environment:
       DATABASE_URL: "sqlite:////app/data/drive.db"
       AUTH_SERVICE_ME_URL: "http://hpc_web:80/api/v1/me"
+      # THÊM DÒNG DƯỚI ĐÂY ĐỂ CHO PHÉP FRONTEND GỌI API
+      CORS_ALLOWED_ORIGINS: "http://localhost:3001" 
     networks:
       - system-management_hpc_network
     restart: unless-stopped
@@ -21,5 +23,5 @@ networks:
     external: true
 
 volumes:
-  drive_data: # Volume for the SQLite database (drive.db)
-  uploads_data: # Volume for user uploaded files
+  drive_data: 
+  uploads_data:

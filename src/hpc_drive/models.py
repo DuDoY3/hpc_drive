@@ -75,6 +75,7 @@ class ProcessStatus(str, Enum):
     """Processing status for malware scanning workflow."""
     PENDING_UPLOAD = "PENDING_UPLOAD"
     SCANNING = "SCANNING"
+    SCAN_PENDING = "SCAN_PENDING"
     READY = "READY"
     INFECTED = "INFECTED"
     ERROR = "ERROR"
@@ -124,11 +125,17 @@ class User(Base):
     # Max size for a single file upload, default 2GB = 2 * 1024 * 1024 * 1024
     max_file_size: Mapped[int] = mapped_column(BigInteger, default=2147483648)
 
+    # ===== NEW FIELDS FOR PHASE 1 =====
+    custom_storage_quota_gb: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    is_unlimited_storage: Mapped[bool] = mapped_column(Boolean, default=False)
+
     # Relations
     owned_items: Mapped[list["DriveItem"]] = relationship(back_populates="owner")
     shared_with_me: Mapped[list["SharePermission"]] = relationship(
         back_populates="shared_with_user"
     )
+    starred_items: Mapped[list["StarredItem"]] = relationship(back_populates="user")
+    notifications: Mapped[list["Notification"]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
 
 class DriveItem(Base):
@@ -145,7 +152,6 @@ class DriveItem(Base):
     name: Mapped[str] = mapped_column(String(255))
     item_type: Mapped[ItemType] = mapped_column(SAEnum(ItemType))
     is_trashed: Mapped[bool] = mapped_column(Boolean, default=False)
-    is_starred: Mapped[bool] = mapped_column(Boolean, default=False)
     trashed_at: Mapped[datetime | None] = mapped_column(DateTime)
     permission: Mapped[Permission] = mapped_column(
         SAEnum(Permission), default=Permission.PRIVATE
@@ -200,6 +206,9 @@ class DriveItem(Base):
         back_populates="drive_item", cascade="all, delete-orphan"
     )
     share_permissions: Mapped[list["SharePermission"]] = relationship(
+        back_populates="item", cascade="all, delete-orphan"
+    )
+    starred_by: Mapped[list["StarredItem"]] = relationship(
         back_populates="item", cascade="all, delete-orphan"
     )
 
@@ -309,3 +318,58 @@ class SigningRequest(Base):
     drive_item: Mapped["DriveItem"] = relationship()
     requester: Mapped["User"] = relationship(foreign_keys=[requester_id])
     approver: Mapped["User | None"] = relationship(foreign_keys=[approver_id])
+
+
+class SystemSetting(Base):
+    """
+    Global system settings as key-value pairs.
+    All attributes are snake_case.
+    """
+    __tablename__: str = "system_settings"
+
+    key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    value: Mapped[str] = mapped_column(String(1024))
+    description: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class StarredItem(Base):
+    """
+    Junction table for user-specific starring of items.
+    """
+
+    __tablename__: str = "starred_items"
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.user_id", ondelete="CASCADE"), primary_key=True
+    )
+    item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("drive_items.item_id", ondelete="CASCADE"), primary_key=True
+    )
+
+    # Relations (Optional but helpful)
+    user: Mapped["User"] = relationship(back_populates="starred_items")
+    item: Mapped["DriveItem"] = relationship(back_populates="starred_by")
+
+
+class Notification(Base):
+    """
+    Stores system and admin notifications for users.
+    """
+    __tablename__: str = "notifications"
+
+    notification_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.user_id", ondelete="CASCADE"), index=True)
+    
+    # Type of notification (e.g., 'QUOTA_CHANGE', 'FILE_DELETED', 'SYSTEM_UPDATE')
+    type: Mapped[str] = mapped_column(String(50))
+    message: Mapped[str] = mapped_column(String(1000))
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    # Relations
+    user: Mapped["User"] = relationship(back_populates="notifications")

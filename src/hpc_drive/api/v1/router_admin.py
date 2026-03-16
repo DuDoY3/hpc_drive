@@ -51,24 +51,62 @@ def get_user_drive_items(
     return {"parent_id": parent_id, "items": items}
 
 
-@router.get("/drive/items", response_model=List[schemas.DriveItemResponse])
+@router.get("/drive/items", response_model=schemas.PaginatedDriveItemListResponse)
 def get_all_items(
     skip: int = 0,
     limit: int = 100,
+    search: str | None = None,
     admin_user: User = Depends(get_current_admin_user),
     db: Session = Depends(get_session),
 ):
     """
     [ADMIN] Get a paginated list of all drive items from all users.
     """
-    items = crud.admin_get_all_items(db=db, skip=skip, limit=limit)
-    # Populate transient fields (owner_username) from the eager-loaded owner relation
+    items, total, file_count, folder_count, total_size = crud.admin_get_all_items(db=db, skip=skip, limit=limit, search=search)
+    
+    # Sửa lại cách mapping data để trả về đúng cấu trúc và lấy được owner_username
     result = []
     for item in items:
-        pydantic_item = schemas.DriveItemResponse.model_validate(item)
-        pydantic_item.owner_username = item.owner.username if item.owner else None
-        result.append(pydantic_item)
-    return result
+        # Chuyển object SQLAlchemy thành dictionary thông qua schema
+        item_dict = schemas.DriveItemResponse.model_validate(item).model_dump()
+        
+        # Gán giá trị owner_username an toàn vào dict
+        item_dict["owner_username"] = item.owner.username if item.owner else None
+        
+        result.append(item_dict)
+        
+    return schemas.PaginatedDriveItemListResponse(
+        items=result,
+        total=total,
+        skip=skip,
+        limit=limit,
+        file_count=file_count,
+        folder_count=folder_count,
+        total_size=total_size
+    )
+
+
+@router.get("/settings", response_model=schemas.SystemSettingsUpdate)
+def get_system_settings(
+    admin_user: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_session),
+):
+    """
+    [ADMIN] Get current system settings
+    """
+    return crud.get_system_settings(db)
+
+
+@router.put("/settings", response_model=schemas.SystemSettingsUpdate)
+def update_system_settings(
+    settings_data: schemas.SystemSettingsUpdate,
+    admin_user: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_session),
+):
+    """
+    [ADMIN] Update system settings
+    """
+    return crud.update_system_settings(db, settings_data)
 
 
 

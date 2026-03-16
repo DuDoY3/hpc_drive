@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     LEARNING_SERVICE_URL: str = os.getenv(
         "LEARNING_SERVICE_URL", "http://localhost:8000"
     )
+    CORS_ALLOWED_ORIGINS: str = os.getenv(
+        "CORS_ALLOWED_ORIGINS", "http://localhost:3001,http://localhost:3000,http://127.0.0.1:3001,http://127.0.0.1:3000"
+    )
 
     # File storage directory
     UPLOAD_DIR: str = "uploads"

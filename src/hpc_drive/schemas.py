@@ -104,6 +104,7 @@ class DriveItemResponse(DriveItemBase):
     owner_username: str | None = None  # Owner's username for shared items
     repository_type: RepositoryType | None = None  # Where the item is stored (PERSONAL/CLASS/DEPARTMENT)
     repository_context_id: int | None = None  # ID of the class or department (if applicable)
+    size: int | None = None  # Total size (recursive for folders)
 
 
 class ShareCreate(BaseModel):
@@ -139,6 +140,17 @@ class DriveItemListResponse(BaseModel):
     parent_id: uuid.UUID | None
     items: list[DriveItemResponse]
 
+
+class PaginatedDriveItemListResponse(BaseModel):
+    """Schema for returning a paginated list of items for admin"""
+
+    items: list[DriveItemResponse]
+    total: int
+    skip: int
+    limit: int
+    file_count: int | None = 0
+    folder_count: int | None = 0
+    total_size: int | None = 0
 
 class DriveItemUpdate(BaseModel):
     """
@@ -177,6 +189,8 @@ class UserResponse(BaseModel):
     storage_quota: int
     used_storage: int
     max_file_size: int
+    custom_storage_quota_gb: int | None = None
+    is_unlimited_storage: bool = False
 
 
 class UserQuotaUpdate(BaseModel):
@@ -184,6 +198,17 @@ class UserQuotaUpdate(BaseModel):
 
     storage_quota: int | None = None
     max_file_size: int | None = None
+    custom_storage_quota_gb: int | None = None
+    is_unlimited_storage: bool | None = None
+
+
+class SystemSettingsUpdate(BaseModel):
+    """Schema for system settings update"""
+
+    max_upload_size_mb: int | None = None
+    blocked_extensions: str | None = None
+    default_quota_gb: int | None = None
+    quarantine_enabled: bool | None = None
 
 
 class StorageUsageResponse(BaseModel):
@@ -196,3 +221,14 @@ class StorageUsageResponse(BaseModel):
     documents_storage: int = 0
     videos_storage: int = 0
     others_storage: int = 0
+
+
+class NotificationResponse(BaseModel):
+    """Schema for returning a notification to the user"""
+    model_config = ConfigDict(from_attributes=True)
+
+    notification_id: uuid.UUID
+    type: str
+    message: str
+    is_read: bool
+    created_at: datetime

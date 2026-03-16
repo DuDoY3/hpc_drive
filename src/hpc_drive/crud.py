@@ -11,7 +11,48 @@ from sqlalchemy.orm import Session, joinedload
 
 from . import models, schemas
 from .config import settings
-from .models import ItemType, OwnerType, Permission, ShareLevel, UserRole
+from .models import ItemType, OwnerType, Permission, ShareLevel, UserRole, StarredItem
+
+
+def populate_stars_to_dicts(db: Session, current_user_id: int, items: list) -> List[dict]:
+    if not items:
+        return []
+    
+    # Lấy danh sách ID của các item, xử lý cả dict lẫn SQLAlchemy object
+    item_ids = []
+    for item in items:
+        if isinstance(item, dict):
+            item_ids.append(item.get("item_id"))
+        else:
+            item_ids.append(item.item_id)
+    
+    # Lọc bỏ None
+    item_ids = [iid for iid in item_ids if iid is not None]
+    
+    # Chỉ query những item_id có trong danh sách hiện tại để tối ưu hiệu suất
+    starred_records = db.query(StarredItem.item_id).filter(
+        StarredItem.user_id == current_user_id,
+        StarredItem.item_id.in_(item_ids)
+    ).all()
+    
+    starred_set = {str(record.item_id) for record in starred_records}
+    
+    result = []
+    for item in items:
+        if isinstance(item, dict):
+            item_dict = item
+            item_uuid = str(item_dict.get("item_id"))
+        elif isinstance(item, schemas.DriveItemResponse):
+            item_dict = item.model_dump()
+            item_uuid = str(item.item_id)
+        else:
+            item_dict = schemas.DriveItemResponse.model_validate(item).model_dump()
+            item_uuid = str(item.item_id)
+            
+        item_dict["is_starred"] = item_uuid in starred_set
+        result.append(item_dict)
+        
+    return result
 
 
 def get_owner_type(role: UserRole) -> OwnerType:
@@ -80,7 +121,7 @@ def get_user_items_in_folder(
     If parent_id is None, it fetches items from the user's root.
     """
     if parent_id is None:
-        return (
+        db_items = (
             db.query(models.DriveItem)
             .options(joinedload(models.DriveItem.file_metadata))
             .filter(
@@ -91,6 +132,9 @@ def get_user_items_in_folder(
             .order_by(models.DriveItem.item_type, models.DriveItem.name)
             .all()
         )
+        response_items = [schemas.DriveItemResponse.model_validate(item).model_dump() for item in db_items]
+        response_items = attach_sizes_to_items(db, response_items)
+        return populate_stars_to_dicts(db, owner_id, response_items)
 
     # Check access to the parent folder
     parent_item = db.query(models.DriveItem).filter(models.DriveItem.item_id == parent_id).first()
@@ -144,14 +188,25 @@ def get_user_items_in_folder(
     if share_entry:
         response_items = []
         for item in items:
-            pydantic_item = schemas.DriveItemResponse.model_validate(item)
-            pydantic_item.is_shared = True
-            pydantic_item.shared_permission = share_entry.permission_level
-            pydantic_item.owner_username = item.owner.username if item.owner else None
-            response_items.append(pydantic_item)
-        return response_items
+            item_dict = schemas.DriveItemResponse.model_validate(item).model_dump()
+            item_dict["is_shared"] = True
+            item_dict["shared_permission"] = share_entry.permission_level
+            item_dict["owner_username"] = item.owner.username if item.owner else None
+            response_items.append(item_dict)
+        
+        response_items = attach_sizes_to_items(db, response_items)
+        return populate_stars_to_dicts(db, owner_id, response_items)
 
-    return items
+    response_items = []
+    for item in items:
+        item_dict = schemas.DriveItemResponse.model_validate(item).model_dump()
+        item_dict["owner_username"] = item.owner.username if item.owner else None
+        response_items.append(item_dict)
+
+    # Attach recursive folder sizes
+    response_items = attach_sizes_to_items(db, response_items)
+
+    return populate_stars_to_dicts(db, owner_id, response_items)
 
 
 def create_file_with_metadata(
@@ -162,6 +217,7 @@ def create_file_with_metadata(
     mime_type: str,
     size: int,
     storage_path: str,
+    process_status: models.ProcessStatus = models.ProcessStatus.READY,
 ) -> models.DriveItem:
     """
     Atomically creates a DriveItem (as FILE) and its FileMetadata.
@@ -216,6 +272,7 @@ def create_file_with_metadata(
         parent_id=parent_id,
         owner_id=owner.user_id,
         owner_type=owner_type,
+        process_status=process_status,
     )
     db.add(db_item)
 
@@ -319,6 +376,14 @@ def trash_item(db: Session, item_id: uuid.UUID, owner_id: int) -> models.DriveIt
 
     db.commit()
     db.refresh(db_item)
+    
+    # Notify user if an admin trashed their item.
+    # This is a placeholder. The actual implementation would need to check if the
+    # `owner_id` passed to this function is different from the `current_user_id`
+    # (the one performing the action), and if the `current_user_id` has admin privileges.
+    # For now, we'll add a generic notification call.
+    # create_notification(db, recipient_id=db_item.owner_id, message=f"Your item '{db_item.name}' has been moved to trash.")
+    
     return db_item
 
 
@@ -359,11 +424,11 @@ def restore_item(db: Session, item_id: uuid.UUID, owner_id: int) -> models.Drive
     return db_item
 
 
-def get_user_trash(db: Session, owner_id: int) -> list[models.DriveItem]:
+def get_user_trash(db: Session, owner_id: int) -> list[dict]:
     """
     Gets all items for a user that are currently in the trash.
     """
-    return (
+    db_items = (
         db.query(models.DriveItem)
         .options(joinedload(models.DriveItem.file_metadata))
         .filter(
@@ -372,6 +437,7 @@ def get_user_trash(db: Session, owner_id: int) -> list[models.DriveItem]:
         .order_by(models.DriveItem.trashed_at.desc())
         .all()
     )
+    return populate_stars_to_dicts(db, owner_id, db_items)
 
 
 def check_for_name_conflict(
@@ -552,16 +618,17 @@ def get_shared_with_me_items(db: Session, user_id: int) -> list[models.DriveItem
     response_items = []
     for item, permission_level in results:
         # Convert to Pydantic model to ensure transient fields are included
-        pydantic_item = schemas.DriveItemResponse.model_validate(item)
-        pydantic_item.shared_permission = permission_level
-        pydantic_item.is_shared = True
-        pydantic_item.owner_username = item.owner.username if item.owner else None
-        response_items.append(pydantic_item)
+        item_dict = schemas.DriveItemResponse.model_validate(item).model_dump()
+        item_dict["shared_permission"] = permission_level
+        item_dict["is_shared"] = True
+        item_dict["owner_username"] = item.owner.username if item.owner else None
+        response_items.append(item_dict)
         
         # DEBUG: Log each item
         print(f"  - Item: {item.name}, Owner: {item.owner.username if item.owner else 'N/A'}, Permission: {permission_level}")
         
-    return response_items
+    response_items = attach_sizes_to_items(db, response_items)
+    return populate_stars_to_dicts(db, user_id, response_items)
 
 
 def get_drive_item(
@@ -586,7 +653,9 @@ def get_drive_item(
         raise HTTPException(status_code=404, detail="Item not found")
 
     if db_item.owner_id == user_id:
-        return db_item
+        item_dict = schemas.DriveItemResponse.model_validate(db_item).model_dump()
+        item_dict = attach_sizes_to_items(db, [item_dict])[0]
+        return populate_stars_to_dicts(db, user_id, [item_dict])[0]
 
     is_shared_with_user = (
         db.query(models.SharePermission)
@@ -598,7 +667,12 @@ def get_drive_item(
     )
 
     if is_shared_with_user:
-        return db_item
+        item_dict = schemas.DriveItemResponse.model_validate(db_item).model_dump()
+        item_dict["is_shared"] = True
+        item_dict["shared_permission"] = is_shared_with_user.permission_level
+        # Attach size
+        item_dict = attach_sizes_to_items(db, [item_dict])[0]
+        return populate_stars_to_dicts(db, user_id, [item_dict])[0]
 
     raise HTTPException(
         status_code=403, detail="You do not have permission to access this item"
@@ -673,39 +747,125 @@ def search_items(
 
     # 6. Filter theo is_starred
     if query.is_starred is not None:
-        base_query = base_query.filter(models.DriveItem.is_starred == query.is_starred)
+        if query.is_starred:
+            base_query = base_query.filter(
+                exists().where(
+                    StarredItem.item_id == models.DriveItem.item_id,
+                    StarredItem.user_id == user_id
+                )
+            )
+        else:
+            base_query = base_query.filter(
+                ~exists().where(
+                    StarredItem.item_id == models.DriveItem.item_id,
+                    StarredItem.user_id == user_id
+                )
+            )
 
     # 7. Distinct và Order
     # Distinct item_id để loại bỏ trùng lặp nếu 1 item được share nhiều lần (dù logic share không cho phép, nhưng an toàn hơn)
-    return base_query.distinct().order_by(models.DriveItem.name).all()
+    db_items = base_query.distinct().order_by(models.DriveItem.name).all()
+    
+    response_items = []
+    for item in db_items:
+        item_dict = schemas.DriveItemResponse.model_validate(item).model_dump()
+        response_items.append(item_dict)
+    
+    response_items = attach_sizes_to_items(db, response_items)
+    return populate_stars_to_dicts(db, user_id, response_items)
 
 
 def admin_get_all_items(
-    db: Session, skip: int = 0, limit: int = 100
-) -> list[models.DriveItem]:
-    """[Admin] Gets all active (non-trashed) items in God Mode."""
-    return (
+    db: Session, skip: int = 0, limit: int = 100, search: str | None = None
+) -> tuple[list[models.DriveItem], int, int, int, int]:
+    """[Admin] Gets all active (non-trashed) items in God Mode with global statistics."""
+    # 1. Base filter for non-trashed items
+    query_filter = [models.DriveItem.is_trashed == False]
+
+    # 2. Add search filter if provided
+    if search:
+        search_term = f"%{search}%"
+        # We need to join User for search if search is provided
+        # Join condition: models.DriveItem.owner_id == models.User.user_id
+        search_filter = or_(
+            models.DriveItem.name.ilike(search_term),
+            models.User.username.ilike(search_term),
+            models.User.email.ilike(search_term)
+        )
+    else:
+        search_filter = None
+
+    # 3. Calculate Total items
+    total_query = db.query(models.DriveItem).filter(*query_filter)
+    if search_filter is not None:
+        total_query = total_query.outerjoin(models.User, models.DriveItem.owner_id == models.User.user_id).filter(search_filter)
+    total = total_query.count()
+
+    # 4. Calculate File count
+    file_count_query = db.query(models.DriveItem).filter(*query_filter, models.DriveItem.item_type == ItemType.FILE)
+    if search_filter is not None:
+        file_count_query = file_count_query.outerjoin(models.User, models.DriveItem.owner_id == models.User.user_id).filter(search_filter)
+    file_count = file_count_query.count()
+
+    # 5. Calculate Folder count
+    folder_count_query = db.query(models.DriveItem).filter(*query_filter, models.DriveItem.item_type == ItemType.FOLDER)
+    if search_filter is not None:
+        folder_count_query = folder_count_query.outerjoin(models.User, models.DriveItem.owner_id == models.User.user_id).filter(search_filter)
+    folder_count = folder_count_query.count()
+
+    # 6. Calculate Total Size
+    size_query = db.query(func.sum(models.FileMetadata.size))\
+        .join(models.DriveItem, models.DriveItem.item_id == models.FileMetadata.item_id)\
+        .filter(*query_filter)
+    if search_filter is not None:
+        size_query = size_query.outerjoin(models.User, models.DriveItem.owner_id == models.User.user_id).filter(search_filter)
+    total_size = size_query.scalar() or 0
+
+    # 7. Fetch the current page of items
+    items_query = db.query(models.DriveItem)\
+        .options(joinedload(models.DriveItem.file_metadata))\
+        .options(joinedload(models.DriveItem.owner))\
+        .filter(*query_filter)
+    
+    if search_filter is not None:
+        items_query = items_query.outerjoin(models.User, models.DriveItem.owner_id == models.User.user_id).filter(search_filter)
+        
+    items = items_query.order_by(models.DriveItem.created_at.desc()).offset(skip).limit(limit).all()
+    
+    return items, total, file_count, folder_count, total_size
+
+
+def toggle_star_item(db: Session, item_id: uuid.UUID, user_id: int) -> dict:
+    """Toggles the is_starred status of a DriveItem for a specific user."""
+    # Get the raw DB item first (not via get_drive_item which returns dict)
+    db_item = (
         db.query(models.DriveItem)
         .options(joinedload(models.DriveItem.file_metadata))
-        .options(joinedload(models.DriveItem.owner))
-        .filter(models.DriveItem.is_trashed == False) # Exclude trashed files by default
-        .order_by(models.DriveItem.created_at.desc())
-        .offset(skip)
-        .limit(limit)
-        .all()
+        .filter(models.DriveItem.item_id == item_id)
+        .first()
     )
-
-
-def toggle_star_item(db: Session, item_id: uuid.UUID, user_id: int) -> models.DriveItem:
-    """Toggles the is_starred status of a DriveItem."""
-    db_item = get_drive_item(db=db, item_id=item_id, user_id=user_id)
     if not db_item:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Item not found")
 
-    db_item.is_starred = not db_item.is_starred
+    existing_star = db.query(StarredItem).filter(
+        StarredItem.item_id == item_id,
+        StarredItem.user_id == user_id
+    ).first()
+
+    if existing_star:
+        db.delete(existing_star)
+        is_starred = False
+    else:
+        new_star = StarredItem(item_id=item_id, user_id=user_id)
+        db.add(new_star)
+        is_starred = True
+    
     db.commit()
-    db.refresh(db_item)
-    return db_item
+    
+    # Convert to dict and force is_starred (bypass all Pydantic/ORM serialization)
+    item_dict = schemas.DriveItemResponse.model_validate(db_item).model_dump()
+    item_dict["is_starred"] = is_starred
+    return item_dict
 
 
 def admin_get_item_by_id(db: Session, item_id: uuid.UUID) -> models.DriveItem:
@@ -725,7 +885,48 @@ def admin_get_item_by_id(db: Session, item_id: uuid.UUID) -> models.DriveItem:
 
 def admin_delete_item_permanently(db: Session, item_id: uuid.UUID):
     db_item = admin_get_item_by_id(db, item_id)
+    
+    # Notify owner before deletion
+    create_notification(
+        db,
+        db_item.owner_id,
+        "FILE_DELETED",
+        f"Admin đã xóa vĩnh viễn mục '{db_item.name}' khỏi hệ thống."
+    )
+
+    # Track items to delete from storage
+    items_to_delete_storage = []
+    total_size_deleted = 0
+    
+    if db_item.item_type == ItemType.FILE and db_item.file_metadata:
+        items_to_delete_storage.append(db_item.file_metadata.storage_path)
+        total_size_deleted += db_item.file_metadata.size
+    elif db_item.item_type == ItemType.FOLDER:
+        # Collect all descendants
+        item_queue = [db_item]
+        while item_queue:
+            current_item = item_queue.pop(0)
+            if current_item.item_type == ItemType.FILE and current_item.file_metadata:
+                items_to_delete_storage.append(current_item.file_metadata.storage_path)
+                total_size_deleted += current_item.file_metadata.size
+                
+            if current_item.item_type == ItemType.FOLDER:
+                children = (
+                    db.query(models.DriveItem)
+                    .options(joinedload(models.DriveItem.file_metadata))
+                    .filter(models.DriveItem.parent_id == current_item.item_id)
+                    .all()
+                )
+                item_queue.extend(children)
+
+    owner = db_item.owner
     try:
+        # Update owner quota before deleting
+        if owner:
+            current_used = owner.used_storage or 0
+            owner.used_storage = max(0, current_used - total_size_deleted)
+            db.add(owner)
+            
         db.delete(db_item)
         db.commit()
     except Exception as e:
@@ -734,6 +935,11 @@ def admin_delete_item_permanently(db: Session, item_id: uuid.UUID):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete item: {e}",
         )
+        
+    # Only delete files from server disk AFTER successful DB commit
+    for path in items_to_delete_storage:
+        _delete_file_from_storage(path)
+        
     return {"detail": "Item deleted permanently"}
 
 
@@ -950,16 +1156,152 @@ def admin_update_user_quota(
 ) -> models.User:
     db_user = admin_get_user_by_id(db, user_id)
     
-    if quota_data.storage_quota is not None:
+    # Đồng bộ hóa các trường dung lượng
+    if quota_data.custom_storage_quota_gb is not None:
+        db_user.custom_storage_quota_gb = quota_data.custom_storage_quota_gb
+        # Tự động cập nhật storage_quota tính bằng bytes
+        db_user.storage_quota = quota_data.custom_storage_quota_gb * (1024**3)
+    elif quota_data.storage_quota is not None:
         db_user.storage_quota = quota_data.storage_quota
+        # Tự động cập nhật custom_storage_quota_gb
+        db_user.custom_storage_quota_gb = int(quota_data.storage_quota / (1024**3))
     
     if quota_data.max_file_size is not None:
         db_user.max_file_size = quota_data.max_file_size
         
+    if quota_data.is_unlimited_storage is not None:
+        db_user.is_unlimited_storage = quota_data.is_unlimited_storage
+        # Nếu bật không giới hạn, ta có thể đặt một con số cực lớn cho storage_quota để các logic check cũ vẫn chạy đúng
+        if quota_data.is_unlimited_storage:
+            db_user.storage_quota = 100 * 1024 * 1024 * 1024 * 1024 # 100 TB
+        
     db.add(db_user)
     db.commit()
     db.refresh(db_user)
+    
+    # Notify user about quota change
+    create_notification(
+        db, 
+        user_id, 
+        "QUOTA_CHANGE", 
+        f"Hạn mức dung lượng của bạn đã được Admin cập nhật thành {db_user.custom_storage_quota_gb or (db_user.storage_quota // 1024**3)} GB."
+    )
+    
     return db_user
+    
+    
+# ===== SYSTEM SETTINGS FUNCTIONS =====
+
+_settings_cache: dict[str, str] = {}
+_cache_timestamp: datetime = datetime.min
+CACHE_TTL_SECONDS = 60
+
+def get_system_settings(db: Session) -> schemas.SystemSettingsUpdate:
+    global _settings_cache, _cache_timestamp
+    
+    if (datetime.utcnow() - _cache_timestamp).total_seconds() < CACHE_TTL_SECONDS and _settings_cache:
+        raw_settings = _settings_cache
+    else:
+        settings = db.query(models.SystemSetting).all()
+        _settings_cache = {s.key: s.value for s in settings}
+        _cache_timestamp = datetime.utcnow()
+        raw_settings = _settings_cache
+        
+    # Defaults
+    max_upload_size_mb = int(raw_settings.get("max_upload_size_mb", "100"))
+    blocked_extensions = raw_settings.get("blocked_extensions", "exe,sh,bat,cmd,com")
+    default_quota_gb = int(raw_settings.get("default_quota_gb", "10"))
+    quarantine_enabled = raw_settings.get("quarantine_enabled", "true").lower() == "true"
+    
+    return schemas.SystemSettingsUpdate(
+        max_upload_size_mb=max_upload_size_mb,
+        blocked_extensions=blocked_extensions,
+        default_quota_gb=default_quota_gb,
+        quarantine_enabled=quarantine_enabled
+    )
+
+def update_system_settings(db: Session, settings_data: schemas.SystemSettingsUpdate) -> schemas.SystemSettingsUpdate:
+    global _settings_cache, _cache_timestamp
+    
+    updates = settings_data.model_dump(exclude_unset=True)
+    
+    for key, value in updates.items():
+        if value is not None:
+            # Convert boolean or int to string
+            str_val = str(value).lower() if isinstance(value, bool) else str(value)
+            
+            setting = db.query(models.SystemSetting).filter(models.SystemSetting.key == key).first()
+            if not setting:
+                setting = models.SystemSetting(key=key, value=str_val)
+                db.add(setting)
+            else:
+                setting.value = str_val
+
+    db.commit()
+
+    # Apply changes to users using default settings
+    if "default_quota_gb" in updates:
+        new_quota_bytes = updates["default_quota_gb"] * (1024**3)
+        db.query(models.User).filter(
+            models.User.custom_storage_quota_gb == None,
+            models.User.is_unlimited_storage == False
+        ).update({"storage_quota": new_quota_bytes}, synchronize_session=False)
+
+    if "max_upload_size_mb" in updates:
+        new_max_bytes = updates["max_upload_size_mb"] * (1024**2)
+        # Update all non-admin users to new global limit
+        db.query(models.User).filter(
+            models.User.role != models.UserRole.ADMIN
+        ).update({"max_file_size": new_max_bytes}, synchronize_session=False)
+
+    db.commit()
+    
+    # Invalidate cache
+    _cache_timestamp = datetime.min
+    return get_system_settings(db)
+
+
+# ===== NOTIFICATION FUNCTIONS =====
+
+def create_notification(db: Session, user_id: int, type: str, message: str) -> models.Notification:
+    """Creates a new notification for a user"""
+    db_notif = models.Notification(
+        user_id=user_id,
+        type=type,
+        message=message
+    )
+    db.add(db_notif)
+    db.commit()
+    db.refresh(db_notif)
+    return db_notif
+
+def get_user_notifications(db: Session, user_id: int, unread_only: bool = True) -> list[models.Notification]:
+    """Gets notifications for a user"""
+    query = db.query(models.Notification).filter(models.Notification.user_id == user_id)
+    if unread_only:
+        query = query.filter(models.Notification.is_read == False)
+    return query.order_by(models.Notification.created_at.desc()).all()
+
+def mark_notification_as_read(db: Session, notification_id: uuid.UUID, user_id: int) -> bool:
+    """Marks a notification as read if it belongs to the user"""
+    db_notif = db.query(models.Notification).filter(
+        models.Notification.notification_id == notification_id,
+        models.Notification.user_id == user_id
+    ).first()
+    if db_notif:
+        db_notif.is_read = True
+        db.commit()
+        return True
+    return False
+
+def mark_all_notifications_read(db: Session, user_id: int) -> int:
+    """Marks all unread notifications as read for a user"""
+    result = db.query(models.Notification).filter(
+        models.Notification.user_id == user_id,
+        models.Notification.is_read == False
+    ).update({"is_read": True}, synchronize_session=False)
+    db.commit()
+    return result
 
 
 def admin_recalculate_user_storage(db: Session, user_id: int) -> models.User:
@@ -1147,13 +1489,14 @@ def save_shared_file_copy(
     # First check if user has access to the original file
     original_item = get_drive_item(db, item_id, user_id)
     
-    if original_item.item_type != ItemType.FILE:
+    if original_item.get("item_type") != ItemType.FILE:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Only files can be copied"
         )
     
-    if not original_item.file_metadata:
+    original_metadata = original_item.get("file_metadata")
+    if not original_metadata:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="File metadata not found"
@@ -1219,7 +1562,7 @@ def save_shared_file_copy(
         # Create file metadata
         new_metadata = models.FileMetadata(
             item_id=new_item.item_id,
-            mime_type=original_item.file_metadata.mime_type,
+            mime_type=original_metadata.get("mime_type"),
             size=file_size,
             storage_path=str(db_storage_path),
             version=1,  # New file starts at version 1
@@ -1269,13 +1612,14 @@ def copy_file_on_server(
     # 1. Verify the user has access to this item
     original_item = get_drive_item(db, item_id, user_id)
 
-    if original_item.item_type != ItemType.FILE:
+    if original_item.get("item_type") != ItemType.FILE:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Chỉ có thể sao chép tệp, không phải thư mục.",
         )
 
-    if not original_item.file_metadata:
+    original_metadata = original_item.get("file_metadata")
+    if not original_metadata:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Không tìm thấy metadata của tệp gốc.",
@@ -1289,7 +1633,7 @@ def copy_file_on_server(
             detail="Không tìm thấy người dùng.",
         )
 
-    file_size = original_item.file_metadata.size
+    file_size = original_metadata.get("size", 0)
 
     if user.role != UserRole.ADMIN:
         if file_size > user.max_file_size:
@@ -1306,7 +1650,7 @@ def copy_file_on_server(
             )
 
     # 3. Resolve source file path
-    source_path = settings.UPLOADS_DIR / original_item.file_metadata.storage_path
+    source_path = settings.UPLOADS_DIR / original_metadata.get("storage_path", "")
 
     if not source_path.exists():
         raise HTTPException(
@@ -1320,8 +1664,8 @@ def copy_file_on_server(
     dest_dir = settings.UPLOADS_DIR / relative_dir
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    dest_path = dest_dir / original_item.name
-    db_storage_path = relative_dir / original_item.name
+    dest_path = dest_dir / original_item.get("name", "unknown")
+    db_storage_path = relative_dir / original_item.get("name", "unknown")
 
     # 5. Copy file on disk using shutil.copy2 (preserves metadata, zero RAM)
     try:
@@ -1337,7 +1681,7 @@ def copy_file_on_server(
         owner_type = get_owner_type(user.role)
 
         new_item = models.DriveItem(
-            name=original_item.name,
+            name=original_item.get("name"),
             item_type=ItemType.FILE,
             parent_id=parent_id,
             owner_id=user_id,
@@ -1348,7 +1692,7 @@ def copy_file_on_server(
 
         new_metadata = models.FileMetadata(
             item_id=new_item.item_id,
-            mime_type=original_item.file_metadata.mime_type,
+            mime_type=original_metadata.get("mime_type"),
             size=file_size,
             storage_path=str(db_storage_path),
             version=1,
@@ -1369,7 +1713,7 @@ def copy_file_on_server(
             dest_path.unlink()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Tệp '{original_item.name}' đã tồn tại trong thư mục đích.",
+            detail=f"Tệp '{original_item.get('name')}' đã tồn tại trong thư mục đích.",
         )
     except Exception as e:
         db.rollback()
@@ -1437,3 +1781,72 @@ def get_user_storage_breakdown(db: Session, user_id: int) -> dict:
             breakdown["others_storage"] += size
 
     return breakdown
+
+
+def get_folder_sizes(db: Session, folder_ids: List[uuid.UUID]) -> dict[uuid.UUID, int]:
+    """
+    Calculates total recursive size for a list of folders using a single recursive CTE.
+    Excludes trashed items.
+    """
+    if not folder_ids:
+        return {}
+
+    # 1. Recursive CTE to find all descendants for requested folders
+    folder_ids_as_uuids = [fid if isinstance(fid, uuid.UUID) else uuid.UUID(str(fid)) for fid in folder_ids]
+    
+    base = select(
+        models.DriveItem.item_id.label("root_id"),
+        models.DriveItem.item_id.label("current_id")
+    ).where(
+        models.DriveItem.item_id.in_(folder_ids_as_uuids),
+        models.DriveItem.is_trashed == False
+    ).cte(name="folder_tree", recursive=True)
+
+    # recursive step: children
+    rec = select(
+        base.c.root_id,
+        models.DriveItem.item_id.label("current_id")
+    ).join(
+        models.DriveItem, 
+        (models.DriveItem.parent_id == base.c.current_id) & (models.DriveItem.is_trashed == False)
+    )
+
+    folder_tree = base.union_all(rec)
+
+    # 2. Sum sizes from file_metadata for all discovered descendants
+    stmt = (
+        select(
+            folder_tree.c.root_id,
+            func.sum(models.FileMetadata.size)
+        )
+        .join(models.FileMetadata, folder_tree.c.current_id == models.FileMetadata.item_id)
+        .group_by(folder_tree.c.root_id)
+    )
+
+    results = db.execute(stmt).all()
+    # Fill missing folders with 0
+    size_map = {fid: 0 for fid in folder_ids_as_uuids}
+    for root_id, total_size in results:
+        size_map[root_id] = total_size or 0
+    return size_map
+
+
+def attach_sizes_to_items(db: Session, items: list[dict]) -> list[dict]:
+    """
+    Helper to calculate and attach folder sizes to a list of item dicts.
+    """
+    folder_ids = [uuid.UUID(str(item["item_id"])) for item in items if item.get("item_type") == "FOLDER"]
+    if not folder_ids:
+        return items
+    
+    size_map = get_folder_sizes(db, folder_ids)
+    
+    for item in items:
+        if item.get("item_type") == "FOLDER":
+            item["size"] = size_map.get(uuid.UUID(str(item["item_id"])), 0)
+        else:
+            # For files, we can also put it in the top-level 'size' for consistency
+            if "file_metadata" in item and item["file_metadata"]:
+                item["size"] = item["file_metadata"].get("size")
+    
+    return items

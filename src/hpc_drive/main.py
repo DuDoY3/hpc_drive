@@ -9,12 +9,14 @@ from .api.v1 import (
     router_curriculum,
     router_department_storage,
     router_drive,
+    router_notifications, # Added router_notifications
     router_signing,
     router_submissions,
 )
 
 # Import from our new database file
 from .database import create_db_and_tables
+from .config import settings
 
 
 @asynccontextmanager
@@ -28,15 +30,18 @@ async def lifespan(app: FastAPI):
     print("Shutting down...")
 
 
-# CORS Configuration - Specific origins required when using credentials
-# CRITICAL: When allow_credentials=True, browsers FORBID allow_origins=["*"]
-# Must specify exact origins for security compliance
-origins = [
-    "http://localhost:3001",   # Primary frontend port
-    "http://localhost:3000",   # Alternative frontend port
-    "http://127.0.0.1:3001",   # Localhost IP variant
-    "http://127.0.0.1:3000",   # Localhost IP variant
-]
+# CORS Configuration - Parse origins from settings
+raw_origins = settings.CORS_ALLOWED_ORIGINS
+if raw_origins:
+    origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
+else:
+    # Fallback to defaults if not set
+    origins = [
+        "http://localhost:3001",
+        "http://localhost:3000",
+        "http://127.0.0.1:3001",
+        "http://127.0.0.1:3000",
+    ]
 
 
 app = FastAPI(
@@ -58,6 +63,7 @@ app.add_middleware(
 # Include the routers
 app.include_router(router_drive.router, prefix="/api/v1")
 app.include_router(router_admin.router, prefix="/api/v1")
+app.include_router(router_notifications.router, prefix="/api/v1")
 app.include_router(router_class_storage.router, prefix="/api/v1")
 app.include_router(router_department_storage.router, prefix="/api/v1")
 app.include_router(router_signing.router, prefix="/api/v1")
